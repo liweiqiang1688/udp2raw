@@ -1473,7 +1473,10 @@ int peek_raw(raw_info_t &raw_info) {
                 return -1;
             }
             recv_info.src_port = ntohs(tcph->source);
-            recv_info.syn = tcph->syn;
+            const unsigned char *wire_tcp = (const unsigned char *)payload;
+            recv_info.syn = (wire_tcp[13] & TH_SYN) != 0;
+            recv_info.ack = (wire_tcp[13] & TH_ACK) != 0;
+            recv_info.rst = (wire_tcp[13] & TH_RST) != 0;
             break;
         }
         case mode_udp: {
@@ -1712,10 +1715,21 @@ int send_raw_tcp(raw_info_t &raw_info, const char *payload, int payloadlen) {  /
     tcph->check = 0;  // leave checksum 0 now, filled later by pseudo header
     tcph->urg_ptr = 0;
 
-    char *tcp_data = send_raw_tcp_buf + +tcph->doff * 4;
+    // TCP data offset and flags are wire bytes.  Do not rely on compiler
+    // bit-field allocation here: the ARM and x86 compilers can lay out the
+    // legacy bit-fields differently even though both hosts are little-endian.
+    // Write the canonical RFC 9293 representation explicitly.
+    unsigned char *wire_tcp = (unsigned char *)send_raw_tcp_buf;
+    const unsigned char wire_doff = (unsigned char)(send_info.syn ? 10 : 8);
+    wire_tcp[12] = (unsigned char)(wire_doff << 4);
+    wire_tcp[13] = (unsigned char)((send_info.syn ? TH_SYN : 0) |
+                                   (send_info.psh ? TH_PUSH : 0) |
+                                   (send_info.ack ? TH_ACK : 0));
+
+    char *tcp_data = send_raw_tcp_buf + (wire_doff * 4);
 
     memcpy(tcp_data, payload, payloadlen);
-    int tcp_totlen = tcph->doff * 4 + payloadlen;
+    int tcp_totlen = wire_doff * 4 + payloadlen;
 
     if (raw_ip_version == AF_INET) {
         pseudo_header v4;
@@ -2182,9 +2196,15 @@ int recv_raw_tcp(raw_info_t &raw_info, char *&payload, int &payloadlen) {
         return -1;
     }
 
-    my_tcphdr *tcph = (struct my_tcphdr *)ip_payload;
+    if (ip_payloadlen < int(sizeof(my_tcphdr))) {
+        mylog(log_trace, "tcp payload shorter than header\n");
+        return -1;
+    }
 
-    unsigned short tcphdrlen = tcph->doff * 4;
+    my_tcphdr *tcph = (struct my_tcphdr *)ip_payload;
+    const unsigned char *wire_tcp = (const unsigned char *)ip_payload;
+
+    unsigned short tcphdrlen = (unsigned short)((wire_tcp[12] >> 4) * 4);
 
     if (!(tcphdrlen > 0 && tcphdrlen <= 60)) {
         mylog(log_debug, "tcph error\n");
@@ -2296,9 +2316,10 @@ int recv_raw_tcp(raw_info_t &raw_info, char *&payload, int &payloadlen) {
     */
     parse_tcp_option(tcp_option, option_end, recv_info);
 
-    recv_info.ack = tcph->ack;
-    recv_info.syn = tcph->syn;
-    recv_info.rst = tcph->rst;
+    const unsigned char wire_flags = wire_tcp[13];
+    recv_info.ack = (wire_flags & TH_ACK) != 0;
+    recv_info.syn = (wire_flags & TH_SYN) != 0;
+    recv_info.rst = (wire_flags & TH_RST) != 0;
     recv_info.src_port = ntohs(tcph->source);
     recv_info.dst_port = ntohs(tcph->dest);
 
@@ -2314,9 +2335,9 @@ int recv_raw_tcp(raw_info_t &raw_info, char *&payload, int &payloadlen) {
         recv_info.ack_seq_counter = 0;
     }
 
-    recv_info.psh = tcph->psh;
+    recv_info.psh = (wire_flags & TH_PUSH) != 0;
 
-    if (tcph->rst == 1) {
+    if (recv_info.rst) {
         raw_info.rst_received++;
 
         if (max_rst_to_show > 0) {
