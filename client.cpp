@@ -19,6 +19,14 @@ extern pcap_t *pcap_handle;
 extern int pcap_captured_full_len;
 #endif
 
+//————— client-side rotation state (anti traffic-policing) —————
+static u64_t rotate_bytes_counter = 0;
+static u64_t rotate_next_threshold = 0;
+static u64_t rotate_last_time = 0;
+static u64_t stall_win_start = 0;   // stall-detector window start (ms)
+static u64_t stall_win_bytes = 0;   // uplink payload bytes inside the window
+static void client_rotate_port(conn_info_t &conn_info, const char *reason);
+
 int client_on_timer(conn_info_t &conn_info)  // for client. called when a timer is ready in epoll
 {
     packet_info_t &send_info = conn_info.raw_info.send_info;
@@ -278,6 +286,26 @@ int client_on_timer(conn_info_t &conn_info)  // for client. called when a timer 
         fail_time_counter = 0;
         mylog(log_trace, "time %llu,%llu\n", get_current_time(), conn_info.last_state_time);
 
+#ifdef UDP2RAW_LINUX
+        // Stall detector: a clamp-to-zero fuse produces no bytes, so the
+        // --rotate-bytes trigger never fires and the flow stalls forever.
+        // Heartbeats alone stay far below 64KB per window; a starved upper
+        // layer (TCP retransmits/ACKs) also stops arriving — either way,
+        // tiny uplink volume for --rotate-stall seconds means this flow is
+        // dead weight: rotate out of it.
+        if (rotate_bytes > 0 && rotate_stall > 0) {
+            u64_t now_ms = get_current_time();
+            if (stall_win_start == 0) stall_win_start = now_ms;
+            if (now_ms - stall_win_start >= (u64_t)rotate_stall * 1000) {
+                if (stall_win_bytes < 65536 && now_ms - rotate_last_time >= (u64_t)rotate_min_interval * 1000) {
+                    client_rotate_port(conn_info, "stall detected");
+                }
+                stall_win_start = now_ms;
+                stall_win_bytes = 0;
+            }
+        }
+#endif
+
         if (get_current_time() - conn_info.last_hb_recv_time > client_conn_timeout) {
             conn_info.state.client_current_state = client_idle;
             conn_info.my_id = get_true_random_number_nz();
@@ -317,10 +345,6 @@ int client_on_timer(conn_info_t &conn_info)  // for client. called when a timer 
 // happens. The reconnect goes through the normal client_idle path, so the
 // blip is the same as a routine reconnect (~1-2 RTTs, covered by upper-layer
 // FEC/retransmits).
-static u64_t rotate_bytes_counter = 0;
-static u64_t rotate_next_threshold = 0;
-static u64_t rotate_last_time = 0;
-
 static u64_t rotate_pick_threshold() {
     u64_t base = rotate_bytes;
     if (base == 0) return 1;
@@ -345,9 +369,12 @@ static void client_rotate_port(conn_info_t &conn_info, const char *reason) {
     rotate_bytes_counter = 0;
     rotate_next_threshold = rotate_pick_threshold();
     rotate_last_time = get_current_time();
+    stall_win_start = 0;
+    stall_win_bytes = 0;
 
 #ifdef UDP2RAW_LINUX
     client_rotate_iptables_rule(new_port);
+    client_rotate_v6_source();
 #endif
     remote_addr.set_port(new_port);
     send_info.new_dst_ip.from_address_t(remote_addr);
@@ -600,6 +627,7 @@ int client_on_udp_recv(conn_info_t &conn_info) {
     if (conn_info.state.client_current_state == client_ready) {
         send_data_safer(conn_info, buf, recv_len, conv);
         client_rotate_account(conn_info, recv_len);
+        stall_win_bytes += (u64_t)recv_len;
     }
     return 0;
 }
@@ -875,6 +903,11 @@ int client_event_loop() {
         mylog(log_info, "client port rotation enabled: threshold=%llu bytes (base %llu, jitter ±%d%%), min_interval=%ds, port range=%d:%d\n",
               rotate_next_threshold, (unsigned long long)rotate_bytes, rotate_jitter, rotate_min_interval, rotate_port_min, rotate_port_max);
     }
+#ifdef UDP2RAW_LINUX
+    if (rotate_v6_prefix[0] != 0 && rotate_v6_dev[0] != 0) {
+        client_rotate_v6_source();  // pick the first source address before the initial connect
+    }
+#endif
 
     udp_fd = socket(local_addr.get_type(), SOCK_DGRAM, IPPROTO_UDP);
     set_buf_size(udp_fd, socket_buf_size);

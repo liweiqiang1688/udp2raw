@@ -128,8 +128,17 @@ extern int rotate_jitter;        // --rotate-jitter: ±percent jitter on the thr
 extern int rotate_min_interval;  // --rotate-min-interval: min seconds between rotations
 extern int rotate_port_min;      // --rotate-ports start:end; 0:0 = stay on the -r port
 extern int rotate_port_max;
+// IPv6 source rotation: on every rotation, pick a fresh random interface-ID
+// inside this /64, "ip -6 addr add .../128" it on rotate_v6_dev and use it as
+// the connection source — the per-flow ISP shaper keys on the full 5-tuple,
+// and a delegated /64 is a practically infinite supply of fresh flows.
+// IIDs carry the marker cec1: in their first group so ops can sweep them.
+extern char rotate_v6_prefix[100];  // --rotate-v6-prefix <addr>/64
+extern char rotate_v6_dev[32];      // --rotate-v6-dev <wan-ifname>
+extern int rotate_stall;            // --rotate-stall <sec>: rotate if uplink <64KB over this window (0=off)
 
 int client_rotate_iptables_rule(int new_port);  // move the -a INPUT-drop rule to the new remote port
+int client_rotate_v6_source();                  // swap the source address to a fresh /128 in the prefix
 
 extern raw_mode_t raw_mode;
 extern u32_t raw_ip_version;

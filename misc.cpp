@@ -72,6 +72,9 @@ u64_t rotate_bytes = 0;  // --rotate-bytes: rotate remote port after N payload b
 int rotate_jitter = 40;
 int rotate_min_interval = 20;
 int rotate_port_min = 0, rotate_port_max = 0;
+char rotate_v6_prefix[100] = "";
+char rotate_v6_dev[32] = "";
+int rotate_stall = 8;
 
 int clear_iptables = 0;
 int wait_xtables_lock = 0;
@@ -167,6 +170,14 @@ void print_help() {
     printf("    --rotate-min-interval <number>        minimum seconds between two rotations,default:20\n");
     printf("    --rotate-ports        <start:end>     remote port range to rotate into,e.g. 6000:6030.\n");
     printf("                                          default: reconnect to the same -r port (still a new 5-tuple)\n");
+    printf("    --rotate-v6-prefix    <addr>/64       also rotate the source address: on every rotation add a\n");
+    printf("                                          fresh random /128 from this delegated prefix on the wan\n");
+    printf("                                          interface and use it as the connection source (v6 only)\n");
+    printf("    --rotate-v6-dev       <ifname>        wan interface for --rotate-v6-prefix address add/del\n");
+    printf("    --rotate-stall        <number>        also rotate when uplink stays below 64KB for this many\n");
+    printf("                                          seconds while ready (escapes clamp-to-zero fuses,\n");
+    printf("                                          which produce no bytes and never trip --rotate-bytes).\n");
+    printf("                                          default:8, 0=disabled\n");
     //	printf("                                          \n");
     printf("other options:\n");
     printf("    --conf-file           <string>        read options from a configuration file instead of command line.\n");
@@ -313,6 +324,9 @@ void process_arg(int argc, char *argv[])  // process all options
             {"rotate-jitter", required_argument, 0, 1},
             {"rotate-min-interval", required_argument, 0, 1},
             {"rotate-ports", required_argument, 0, 1},
+            {"rotate-v6-prefix", required_argument, 0, 1},
+            {"rotate-v6-dev", required_argument, 0, 1},
+            {"rotate-stall", required_argument, 0, 1},
             {NULL, 0, 0, 0}};
 
     process_log_level(argc, argv);
@@ -710,6 +724,16 @@ void process_arg(int argc, char *argv[])  // process all options
                     assert(rotate_port_min > 0 && rotate_port_min <= 65535);
                     assert(rotate_port_max >= rotate_port_min && rotate_port_max <= 65535);
                     mylog(log_info, "rotate_ports=%d:%d \n", rotate_port_min, rotate_port_max);
+                } else if (strcmp(long_options[option_index].name, "rotate-v6-prefix") == 0) {
+                    sscanf(optarg, "%99s", rotate_v6_prefix);
+                    mylog(log_info, "rotate_v6_prefix=%s \n", rotate_v6_prefix);
+                } else if (strcmp(long_options[option_index].name, "rotate-v6-dev") == 0) {
+                    sscanf(optarg, "%31s", rotate_v6_dev);
+                    mylog(log_info, "rotate_v6_dev=%s \n", rotate_v6_dev);
+                } else if (strcmp(long_options[option_index].name, "rotate-stall") == 0) {
+                    sscanf(optarg, "%d", &rotate_stall);
+                    assert(rotate_stall >= 0 && rotate_stall <= 3600);
+                    mylog(log_info, "rotate_stall=%d \n", rotate_stall);
                 } else {
                     mylog(log_warn, "ignored unknown long option ,option_index:%d code:<%x>\n", option_index, optopt);
                 }
@@ -1287,6 +1311,66 @@ int client_rotate_iptables_rule(int new_port) {
         }
     }
     mylog(log_info, "rotate: iptables INPUT drop rule moved to sport %d\n", new_port);
+    return 0;
+}
+
+//————— IPv6 source rotation (client only) —————
+// Every rotation gets a fresh random interface-ID inside the delegated /64,
+// added as /128 on the wan interface so the ONU's NDP delivers return traffic.
+// IID first group is the marker 0xcec1 — stale addresses can be swept with
+// "ip -6 addr ... | grep cec1:".
+static char v6_cur_addr[100] = "";
+static struct in6_addr v6_prefix_bin;
+static int v6_prefix_parsed = 0;
+
+int client_rotate_v6_source() {
+    if (rotate_v6_prefix[0] == 0 || rotate_v6_dev[0] == 0) return 0;
+    if (remote_addr.get_type() != AF_INET6) {
+        mylog(log_error, "rotate-v6-prefix requires an IPv6 -r remote, ignoring\n");
+        return -1;
+    }
+    if (!v6_prefix_parsed) {
+        char prefix_text[100];
+        snprintf(prefix_text, sizeof(prefix_text), "%s", rotate_v6_prefix);
+        int plen = 64;
+        char *slash = strchr(prefix_text, '/');
+        if (slash) {
+            *slash = 0;
+            sscanf(slash + 1, "%d", &plen);
+        }
+        if (plen != 64) {
+            mylog(log_error, "rotate-v6-prefix: only /64 is supported (got /%d)\n", plen);
+            return -1;
+        }
+        if (inet_pton(AF_INET6, prefix_text, &v6_prefix_bin) != 1) {
+            mylog(log_error, "rotate-v6-prefix: invalid prefix %s\n", prefix_text);
+            return -1;
+        }
+        v6_prefix_parsed = 1;
+    }
+    struct in6_addr addr = v6_prefix_bin;
+    addr.s6_addr[8] = 0xce;
+    addr.s6_addr[9] = 0xc1;
+    for (int i = 10; i < 16; i++)
+        addr.s6_addr[i] = (uint8_t)(get_true_random_number() & 0xff);
+    char new_addr[100];
+    inet_ntop(AF_INET6, &addr, new_addr, sizeof(new_addr));
+
+    char *output;
+    char cmd[200];
+    snprintf(cmd, sizeof(cmd), "ip -6 addr add %s/128 dev %s nodad", new_addr, rotate_v6_dev);
+    if (run_command(string(cmd), output, show_log) != 0) {
+        mylog(log_warn, "rotate-v6: addr add failed (%s) — keeping old source\n", cmd);
+        return -1;
+    }
+    if (v6_cur_addr[0] != 0) {
+        snprintf(cmd, sizeof(cmd), "ip -6 addr del %s/128 dev %s", v6_cur_addr, rotate_v6_dev);
+        run_command(string(cmd), output, show_none);
+    }
+    snprintf(v6_cur_addr, sizeof(v6_cur_addr), "%s", new_addr);
+    source_addr.from_str_ip_only(v6_cur_addr);
+    force_source_ip = 1;
+    mylog(log_info, "rotate-v6: source address is now %s dev %s\n", v6_cur_addr, rotate_v6_dev);
     return 0;
 }
 
