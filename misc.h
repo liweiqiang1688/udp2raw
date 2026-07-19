@@ -120,6 +120,17 @@ extern int debug_resend;  // debug only
 extern char key_string[1000];  // -k option
 extern char fifo_file[1000];
 
+// client-side remote-port rotation (anti traffic-policing): swap the outer
+// 5-tuple to a fresh port after --rotate-bytes payload bytes, before the
+// ISP's per-flow shaper ("fuse") trips. All rotate_* knobs are client-only.
+extern u64_t rotate_bytes;       // --rotate-bytes: payload bytes per flow, 0=disabled
+extern int rotate_jitter;        // --rotate-jitter: ±percent jitter on the threshold
+extern int rotate_min_interval;  // --rotate-min-interval: min seconds between rotations
+extern int rotate_port_min;      // --rotate-ports start:end; 0:0 = stay on the -r port
+extern int rotate_port_max;
+
+int client_rotate_iptables_rule(int new_port);  // move the -a INPUT-drop rule to the new remote port
+
 extern raw_mode_t raw_mode;
 extern u32_t raw_ip_version;
 

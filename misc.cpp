@@ -68,6 +68,11 @@ char key_string[1000] = "secret key";  // -k option
 
 char fifo_file[1000] = "";
 
+u64_t rotate_bytes = 0;  // --rotate-bytes: rotate remote port after N payload bytes (client only, 0=disabled)
+int rotate_jitter = 40;
+int rotate_min_interval = 20;
+int rotate_port_min = 0, rotate_port_max = 0;
+
 int clear_iptables = 0;
 int wait_xtables_lock = 0;
 #ifdef UDP2RAW_LINUX
@@ -154,6 +159,14 @@ void print_help() {
     printf("    --source-ip           <ip>            force source-ip for raw socket\n");
     printf("    --source-port         <port>          force source-port for raw socket,tcp/udp only\n");
     printf("                                          this option disables port changing while re-connecting\n");
+    printf("    --rotate-bytes        <number>        rotate the remote port after N payload bytes (0=disabled,default).\n");
+    printf("                                          helps against per-flow ISP traffic policing: the outer 5-tuple\n");
+    printf("                                          is swapped (fresh source port + new remote port) before the\n");
+    printf("                                          flow accumulates enough volume to get throttled\n");
+    printf("    --rotate-jitter       <number>        ±percent jitter on the --rotate-bytes threshold,0-90,default:40\n");
+    printf("    --rotate-min-interval <number>        minimum seconds between two rotations,default:20\n");
+    printf("    --rotate-ports        <start:end>     remote port range to rotate into,e.g. 6000:6030.\n");
+    printf("                                          default: reconnect to the same -r port (still a new 5-tuple)\n");
     //	printf("                                          \n");
     printf("other options:\n");
     printf("    --conf-file           <string>        read options from a configuration file instead of command line.\n");
@@ -296,6 +309,10 @@ void process_arg(int argc, char *argv[])  // process all options
             {"no-pcap-mutex", no_argument, 0, 1},
 #endif
             {"fix-gro", no_argument, 0, 1},
+            {"rotate-bytes", required_argument, 0, 1},
+            {"rotate-jitter", required_argument, 0, 1},
+            {"rotate-min-interval", required_argument, 0, 1},
+            {"rotate-ports", required_argument, 0, 1},
             {NULL, 0, 0, 0}};
 
     process_log_level(argc, argv);
@@ -677,6 +694,22 @@ void process_arg(int argc, char *argv[])  // process all options
                 } else if (strcmp(long_options[option_index].name, "fix-gro") == 0) {
                     mylog(log_info, "--fix-gro enabled\n");
                     g_fix_gro = 1;
+                } else if (strcmp(long_options[option_index].name, "rotate-bytes") == 0) {
+                    sscanf(optarg, "%llu", (unsigned long long *)&rotate_bytes);
+                    mylog(log_info, "rotate_bytes=%llu \n", (unsigned long long)rotate_bytes);
+                } else if (strcmp(long_options[option_index].name, "rotate-jitter") == 0) {
+                    sscanf(optarg, "%d", &rotate_jitter);
+                    assert(rotate_jitter >= 0 && rotate_jitter <= 90);
+                    mylog(log_info, "rotate_jitter=%d \n", rotate_jitter);
+                } else if (strcmp(long_options[option_index].name, "rotate-min-interval") == 0) {
+                    sscanf(optarg, "%d", &rotate_min_interval);
+                    assert(rotate_min_interval >= 0);
+                    mylog(log_info, "rotate_min_interval=%d \n", rotate_min_interval);
+                } else if (strcmp(long_options[option_index].name, "rotate-ports") == 0) {
+                    sscanf(optarg, "%d:%d", &rotate_port_min, &rotate_port_max);
+                    assert(rotate_port_min > 0 && rotate_port_min <= 65535);
+                    assert(rotate_port_max >= rotate_port_min && rotate_port_max <= 65535);
+                    mylog(log_info, "rotate_ports=%d:%d \n", rotate_port_min, rotate_port_max);
                 } else {
                     mylog(log_warn, "ignored unknown long option ,option_index:%d code:<%x>\n", option_index, optopt);
                 }
@@ -1211,6 +1244,49 @@ int keep_iptables_rule()  // magic to work on a machine without grep/iptables --
         mylog(log_warn, "rule_keep_del failed %d\n", i);
 
     mylog(log_debug, "keep_iptables_rule end %llu\n", get_current_time());
+    return 0;
+}
+
+// Move the auto-added (-a) INPUT-drop rule to a new remote port after a client
+// port rotation. Without this the kernel would see packets from the new port
+// and RST the fake connection. Deletes the old jump(s), rebuilds the pattern
+// strings (so later keep/clear passes operate on the new port), re-adds.
+int client_rotate_iptables_rule(int new_port) {
+    if (!iptables_rule_added) return 0;  // -a not in use, nothing to swap
+
+    char *output;
+    for (int i = 0; i <= iptables_rule_keeped; i++) {
+        run_command(rule_keep_del[i], output, show_none);
+        run_command(rule_keep_del[i], output, show_none);  // twice, same as keep_iptables_rule
+    }
+
+    char tmp_pattern[200];
+    tmp_pattern[0] = 0;
+    if (raw_mode == mode_faketcp) {
+        sprintf(tmp_pattern, "-s %s -p tcp -m tcp --sport %d", remote_addr.get_ip(), new_port);
+    } else if (raw_mode == mode_udp) {
+        sprintf(tmp_pattern, "-s %s -p udp -m udp --sport %d", remote_addr.get_ip(), new_port);
+    } else if (raw_mode == mode_icmp) {
+        if (raw_ip_version == AF_INET)
+            sprintf(tmp_pattern, "-s %s -p icmp --icmp-type 0", remote_addr.get_ip());
+        else
+            sprintf(tmp_pattern, "-s %s -p icmpv6 --icmpv6-type 129", remote_addr.get_ip());
+    } else {
+        return -1;
+    }
+    iptables_pattern = tmp_pattern;
+
+    string dummy = "";
+    for (int i = 0; i <= iptables_rule_keeped; i++) {
+        rule_keep[i] = dummy + iptables_pattern + " -j " + chain[i];
+        rule_keep_add[i] = iptables_command + "-I INPUT " + rule_keep[i];
+        rule_keep_del[i] = iptables_command + "-D INPUT " + rule_keep[i];
+        if (run_command(rule_keep_add[i], output, show_log) != 0) {
+            mylog(log_warn, "rotate: failed to add iptables rule for new port %d\n", new_port);
+            return -1;
+        }
+    }
+    mylog(log_info, "rotate: iptables INPUT drop rule moved to sport %d\n", new_port);
     return 0;
 }
 

@@ -309,6 +309,65 @@ int client_on_timer(conn_info_t &conn_info)  // for client. called when a timer 
     }
     return 0;
 }
+
+//————— client-side remote-port rotation (anti traffic-policing) —————
+// A single outer flow gets throttled/reset by the ISP after it accumulates
+// some volume (measured: ~150-700MB at full speed). Rotate to a fresh 5-tuple
+// (new source port + new remote port from --rotate-ports) *before* that
+// happens. The reconnect goes through the normal client_idle path, so the
+// blip is the same as a routine reconnect (~1-2 RTTs, covered by upper-layer
+// FEC/retransmits).
+static u64_t rotate_bytes_counter = 0;
+static u64_t rotate_next_threshold = 0;
+static u64_t rotate_last_time = 0;
+
+static u64_t rotate_pick_threshold() {
+    u64_t base = rotate_bytes;
+    if (base == 0) return 1;
+    if (rotate_jitter > 0) {
+        int span = 2 * rotate_jitter + 1;
+        int pct = 100 - rotate_jitter + (int)(get_true_random_number() % (u64_t)span);
+        base = base * (u64_t)pct / 100;
+    }
+    return base == 0 ? 1 : base;
+}
+
+static void client_rotate_port(conn_info_t &conn_info, const char *reason) {
+    packet_info_t &send_info = conn_info.raw_info.send_info;
+    int old_port = remote_addr.get_port();
+    int new_port = old_port;
+    if (rotate_port_min > 0 && rotate_port_max > rotate_port_min) {
+        int range = rotate_port_max - rotate_port_min + 1;
+        while (new_port == old_port)
+            new_port = rotate_port_min + (int)(get_true_random_number() % (u64_t)range);
+    }
+    u64_t rotated_bytes = rotate_bytes_counter;
+    rotate_bytes_counter = 0;
+    rotate_next_threshold = rotate_pick_threshold();
+    rotate_last_time = get_current_time();
+
+#ifdef UDP2RAW_LINUX
+    client_rotate_iptables_rule(new_port);
+#endif
+    remote_addr.set_port(new_port);
+    send_info.new_dst_ip.from_address_t(remote_addr);
+    send_info.dst_port = new_port;
+    conn_info.state.client_current_state = client_idle;
+    conn_info.my_id = get_true_random_number_nz();
+    mylog(log_info, "port rotation (%s): remote port %d -> %d after %llu payload bytes, next threshold %llu\n",
+          reason, old_port, new_port, rotated_bytes, rotate_next_threshold);
+    client_on_timer(conn_info);  // re-bind + re-handshake now, don't wait a timer tick
+}
+
+static void client_rotate_account(conn_info_t &conn_info, int payload_bytes) {
+    if (rotate_bytes == 0) return;
+    if (conn_info.state.client_current_state != client_ready) return;
+    rotate_bytes_counter += (u64_t)payload_bytes;
+    if (rotate_bytes_counter < rotate_next_threshold) return;
+    if (get_current_time() - rotate_last_time < (u64_t)rotate_min_interval * 1000) return;
+    client_rotate_port(conn_info, "bytes threshold");
+}
+
 int client_on_raw_recv_hs2_or_ready(conn_info_t &conn_info, char type, char *data, int data_len) {
     packet_info_t &send_info = conn_info.raw_info.send_info;
     packet_info_t &recv_info = conn_info.raw_info.recv_info;
@@ -363,6 +422,7 @@ int client_on_raw_recv_hs2_or_ready(conn_info_t &conn_info, char type, char *dat
             mylog(log_warn, "sento returned %d,%s,%02x,%s\n", ret, get_sock_error(), int(tmp_addr.get_type()), tmp_addr.get_str());
             // perror("ret<0");
         }
+        client_rotate_account(conn_info, data_len);
     } else {
         mylog(log_warn, "unknown packet,this shouldnt happen.\n");
         return -1;
@@ -539,6 +599,7 @@ int client_on_udp_recv(conn_info_t &conn_info) {
 
     if (conn_info.state.client_current_state == client_ready) {
         send_data_safer(conn_info, buf, recv_len, conv);
+        client_rotate_account(conn_info, recv_len);
     }
     return 0;
 }
@@ -633,6 +694,9 @@ void fifo_cb(struct ev_loop *loop, struct ev_io *watcher, int revents) {
         mylog(log_info, "received command: reconnect\n");
         conn_info.state.client_current_state = client_idle;
         conn_info.my_id = get_true_random_number_nz();
+    } else if (strcmp(buf, "rotate") == 0) {
+        mylog(log_info, "received command: rotate\n");
+        client_rotate_port(conn_info, "fifo command");
     } else {
         mylog(log_info, "unknown command\n");
     }
@@ -804,6 +868,13 @@ int client_event_loop() {
 
     send_info.new_dst_ip.from_address_t(remote_addr);
     send_info.dst_port = remote_addr.get_port();
+
+    if (rotate_bytes > 0) {
+        rotate_next_threshold = rotate_pick_threshold();
+        rotate_last_time = get_current_time();
+        mylog(log_info, "client port rotation enabled: threshold=%llu bytes (base %llu, jitter ±%d%%), min_interval=%ds, port range=%d:%d\n",
+              rotate_next_threshold, (unsigned long long)rotate_bytes, rotate_jitter, rotate_min_interval, rotate_port_min, rotate_port_max);
+    }
 
     udp_fd = socket(local_addr.get_type(), SOCK_DGRAM, IPPROTO_UDP);
     set_buf_size(udp_fd, socket_buf_size);
