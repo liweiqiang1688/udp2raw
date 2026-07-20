@@ -77,6 +77,51 @@ char rotate_v6_dev[32] = "";
 int rotate_stall = 8;
 char rotate_dst_list[2000] = "";
 
+listen_spec_t listen_specs[MAX_LISTEN_SPECS];
+int listen_spec_cnt = 0;
+
+// Parse "addr:port", "addr:min-max", "[v6]:port", "[v6]:min-max" into a spec.
+int parse_listen_spec(const char *str, listen_spec_t &spec) {
+    char buf[200];
+    snprintf(buf, sizeof(buf), "%s", str);
+    char *colon;
+    if (buf[0] == '[') {
+        colon = strrchr(buf, ']');
+        if (colon == nullptr || colon[1] != ':') {
+            mylog(log_fatal, "invalid listen spec [%s], want [v6]:port[-max]\n", str);
+            return -1;
+        }
+        colon++;
+    } else {
+        colon = strrchr(buf, ':');
+        if (colon == nullptr) {
+            mylog(log_fatal, "invalid listen spec [%s], want addr:port[-max]\n", str);
+            return -1;
+        }
+    }
+    char *dash = strchr(colon + 1, '-');
+    if (dash != nullptr) {
+        *dash = 0;
+        spec.port_min = atoi(colon + 1);
+        spec.port_max = atoi(dash + 1);
+        char tmp[200];  // from_str wants a single port — re-anchor on port_min
+        snprintf(tmp, sizeof(tmp), "%.*s:%d", (int)(colon - buf), buf, spec.port_min);
+        spec.addr.from_str(tmp);
+    } else {
+        spec.port_min = spec.port_max = atoi(colon + 1);
+        spec.addr.from_str(buf);
+    }
+    if (spec.port_min <= 0 || spec.port_max < spec.port_min || spec.port_max > 65535) {
+        mylog(log_fatal, "invalid port range in listen spec [%s]\n", str);
+        return -1;
+    }
+    if (spec.port_min <= 22 && spec.port_max >= 22) {
+        mylog(log_fatal, "port 22 not allowed\n");
+        return -1;
+    }
+    return 0;
+}
+
 int clear_iptables = 0;
 int wait_xtables_lock = 0;
 #ifdef UDP2RAW_LINUX
@@ -86,6 +131,7 @@ string iptables_pattern = "";
 int iptables_rule_added = 0;
 int iptables_rule_keeped = 0;
 int iptables_rule_keep_index = 0;
+string spec_cmd[MAX_LISTEN_SPECS];  // iptables/ip6tables command per listen spec
 #endif
 
 program_mode_t program_mode = unset_mode;  // 0 unset; 1client 2server
@@ -182,6 +228,9 @@ void print_help() {
     printf("    --rotate-dst          <a1,a2,...>     comma-separated destination address pool (v6): every\n");
     printf("                                          rotation also jumps to a different remote address from\n");
     printf("                                          this list, so flows differ on all 5 tuple fields\n");
+    printf("    --l2                  <addr>:<p[-m]>  extra listen spec (server only, repeatable up to 4):\n");
+    printf("                                          one process then serves all specs, e.g.\n");
+    printf("                                          -l 0.0.0.0:6000-6030 --l2 [::]:6100-6107\n");
     //	printf("                                          \n");
     printf("other options:\n");
     printf("    --conf-file           <string>        read options from a configuration file instead of command line.\n");
@@ -332,6 +381,7 @@ void process_arg(int argc, char *argv[])  // process all options
             {"rotate-v6-dev", required_argument, 0, 1},
             {"rotate-stall", required_argument, 0, 1},
             {"rotate-dst", required_argument, 0, 1},
+            {"l2", required_argument, 0, 1},
             {NULL, 0, 0, 0}};
 
     process_log_level(argc, argv);
@@ -417,23 +467,20 @@ void process_arg(int argc, char *argv[])  // process all options
         switch (opt) {
             case 'l':
                 no_l = 0;
-                local_addr.from_str(optarg);
-                if (local_addr.get_port() == 22) {
-                    mylog(log_fatal, "port 22 not allowed\n");
+                if (listen_spec_cnt == 0) {
+                    if (parse_listen_spec(optarg, listen_specs[0]) != 0)
+                        myexit(-1);
+                    local_addr = listen_specs[0].addr;
+                    listen_spec_cnt = 1;
+                } else if (listen_spec_cnt < MAX_LISTEN_SPECS) {
+                    // repeated -l acts like --l2 (extra listen spec)
+                    if (parse_listen_spec(optarg, listen_specs[listen_spec_cnt]) != 0)
+                        myexit(-1);
+                    listen_spec_cnt++;
+                } else {
+                    mylog(log_fatal, "too many listen specs (max %d)\n", MAX_LISTEN_SPECS);
                     myexit(-1);
                 }
-                /*
-                if (strchr(optarg, ':') != 0) {
-                        sscanf(optarg, "%[^:]:%d", local_ip, &local_port);
-                        if(local_port==22)
-                        {
-                                mylog(log_fatal,"port 22 not allowed\n");
-                                myexit(-1);
-                        }
-                } else {
-                        mylog(log_fatal,"invalid parameter for -l ,%s,should be ip:port\n",optarg);
-                        myexit(-1);
-                }*/
                 break;
             case 'r':
                 no_r = 0;
@@ -742,6 +789,17 @@ void process_arg(int argc, char *argv[])  // process all options
                 } else if (strcmp(long_options[option_index].name, "rotate-dst") == 0) {
                     sscanf(optarg, "%1999s", rotate_dst_list);
                     mylog(log_info, "rotate_dst_list=%s \n", rotate_dst_list);
+                } else if (strcmp(long_options[option_index].name, "l2") == 0) {
+                    no_l = 0;
+                    if (listen_spec_cnt >= MAX_LISTEN_SPECS) {
+                        mylog(log_fatal, "too many listen specs (max %d)\n", MAX_LISTEN_SPECS);
+                        myexit(-1);
+                    }
+                    if (parse_listen_spec(optarg, listen_specs[listen_spec_cnt]) != 0)
+                        myexit(-1);
+                    if (listen_spec_cnt == 0) local_addr = listen_specs[0].addr;
+                    listen_spec_cnt++;
+                    mylog(log_info, "extra listen spec #%d registered\n", listen_spec_cnt - 1);
                 } else {
                     mylog(log_warn, "ignored unknown long option ,option_index:%d code:<%x>\n", option_index, optopt);
                 }
@@ -928,6 +986,7 @@ void iptables_rule()  // handles -a -g --gen-add  --keep-rule --clear --wait-loc
     }
     char tmp_pattern[200];
     string pattern = "";
+    vector<string> patterns;
 
     if (program_mode == client_mode) {
         tmp_pattern[0] = 0;
@@ -944,35 +1003,54 @@ void iptables_rule()  // handles -a -g --gen-add  --keep-rule --clear --wait-loc
                 sprintf(tmp_pattern, "-s %s -p icmpv6 --icmpv6-type 129", remote_addr.get_ip());
         }
         pattern += tmp_pattern;
+        spec_cmd[0] = iptables_command;
+        patterns.push_back(pattern);
     }
     if (program_mode == server_mode) {
-        tmp_pattern[0] = 0;
-        if (raw_ip_version == AF_INET) {
-            if (local_addr.inner.ipv4.sin_addr.s_addr != 0) {
-                sprintf(tmp_pattern, "-d %s ", local_addr.get_ip());
-            }
-        } else {
-            char zero_arr[16] = {0};
-            if (memcmp(&local_addr.inner.ipv6.sin6_addr, zero_arr, 16) != 0) {
-                sprintf(tmp_pattern, "-d %s ", local_addr.get_ip());
-            }
-        }
-        pattern += tmp_pattern;
+        // one pattern per listen spec; a spec's own address family decides
+        // whether its rule goes into iptables or ip6tables
+        for (int s = 0; s < listen_spec_cnt; s++) {
+            listen_spec_t &sp = listen_specs[s];
+            int family = sp.addr.get_type();
+            spec_cmd[s] = (family == AF_INET) ? "iptables " : "ip6tables ";
+            if (wait_xtables_lock) spec_cmd[s] += "-w ";
 
-        tmp_pattern[0] = 0;
-        if (raw_mode == mode_faketcp) {
-            sprintf(tmp_pattern, "-p tcp -m tcp --dport %d", local_addr.get_port());
+            string pattern_s = "";
+            tmp_pattern[0] = 0;
+            if (family == AF_INET) {
+                if (sp.addr.inner.ipv4.sin_addr.s_addr != 0) {
+                    sprintf(tmp_pattern, "-d %s ", sp.addr.get_ip());
+                }
+            } else {
+                char zero_arr[16] = {0};
+                if (memcmp(&sp.addr.inner.ipv6.sin6_addr, zero_arr, 16) != 0) {
+                    sprintf(tmp_pattern, "-d %s ", sp.addr.get_ip());
+                }
+            }
+            pattern_s += tmp_pattern;
+
+            tmp_pattern[0] = 0;
+            if (raw_mode == mode_faketcp) {
+                if (sp.port_min == sp.port_max)
+                    sprintf(tmp_pattern, "-p tcp -m tcp --dport %d", sp.port_min);
+                else
+                    sprintf(tmp_pattern, "-p tcp -m multiport --dports %d:%d", sp.port_min, sp.port_max);
+            }
+            if (raw_mode == mode_udp) {
+                if (sp.port_min == sp.port_max)
+                    sprintf(tmp_pattern, "-p udp -m udp --dport %d", sp.port_min);
+                else
+                    sprintf(tmp_pattern, "-p udp -m multiport --dports %d:%d", sp.port_min, sp.port_max);
+            }
+            if (raw_mode == mode_icmp) {
+                if (family == AF_INET)
+                    sprintf(tmp_pattern, "-p icmp --icmp-type 8");
+                else
+                    sprintf(tmp_pattern, "-p icmpv6 --icmpv6-type 128");
+            }
+            pattern_s += tmp_pattern;
+            patterns.push_back(pattern_s);
         }
-        if (raw_mode == mode_udp) {
-            sprintf(tmp_pattern, "-p udp -m udp --dport %d", local_addr.get_port());
-        }
-        if (raw_mode == mode_icmp) {
-            if (raw_ip_version == AF_INET)
-                sprintf(tmp_pattern, "-p icmp --icmp-type 8");
-            else
-                sprintf(tmp_pattern, "-p icmpv6 --icmpv6-type 128");
-        }
-        pattern += tmp_pattern;
     }
     /*
             if(!simple_rule)
@@ -1000,7 +1078,7 @@ void iptables_rule()  // handles -a -g --gen-add  --keep-rule --clear --wait-loc
 
     if (generate_iptables_rule) {
         string rule = iptables_command + "-I INPUT ";
-        rule += pattern;
+        rule += patterns[0];
         rule += " -j DROP";
 
         printf("generated iptables rule:\n");
@@ -1008,12 +1086,15 @@ void iptables_rule()  // handles -a -g --gen-add  --keep-rule --clear --wait-loc
         myexit(0);
     }
     if (generate_iptables_rule_add) {
-        iptables_gen_add(pattern.c_str(), const_id);
+        iptables_gen_add(patterns[0].c_str(), const_id);
         myexit(0);
     }
 
     if (auto_add_iptables_rule) {
-        iptables_rule_init(pattern.c_str(), const_id, keep_rule);
+        for (int s = 0; s < (int)patterns.size(); s++) {
+            iptables_command = spec_cmd[s];
+            iptables_rule_init(patterns[s].c_str(), const_id, keep_rule, s);
+        }
         if (keep_rule) {
             if (pthread_create(&keep_thread, NULL, run_keep, 0)) {
                 mylog(log_fatal, "Error creating thread\n");
@@ -1164,10 +1245,12 @@ int handle_lower_level(raw_info_t &raw_info)  // fill lower_level info,when --lo
     return 0;
 }
 
-string chain[2];
-string rule_keep[2];
-string rule_keep_add[2];
-string rule_keep_del[2];
+// Per listen-spec rule bookkeeping (first index) × keep-mode alternation
+// (second index). Single-listen setups only ever use slot [0][*].
+string chain[MAX_LISTEN_SPECS][2];
+string rule_keep[MAX_LISTEN_SPECS][2];
+string rule_keep_add[MAX_LISTEN_SPECS][2];
+string rule_keep_del[MAX_LISTEN_SPECS][2];
 u64_t keep_rule_last_time = 0;
 
 pthread_t keep_thread;
@@ -1175,27 +1258,27 @@ int keep_thread_running = 0;
 int iptables_gen_add(const char *s, u32_t const_id) {
     string dummy = "";
     iptables_pattern = s;
-    chain[0] = dummy + "udp2rawDwrW_C";
-    rule_keep[0] = dummy + iptables_pattern + " -j " + chain[0];
-    rule_keep_add[0] = iptables_command + "-I INPUT " + rule_keep[0];
+    chain[0][0] = dummy + "udp2rawDwrW_C";
+    rule_keep[0][0] = dummy + iptables_pattern + " -j " + chain[0][0];
+    rule_keep_add[0][0] = iptables_command + "-I INPUT " + rule_keep[0][0];
 
     char *output;
-    run_command(iptables_command + "-N " + chain[0], output, show_none);
-    run_command(iptables_command + "-F " + chain[0], output);
-    run_command(iptables_command + "-I " + chain[0] + " -j DROP", output);
+    run_command(iptables_command + "-N " + chain[0][0], output, show_none);
+    run_command(iptables_command + "-F " + chain[0][0], output);
+    run_command(iptables_command + "-I " + chain[0][0] + " -j DROP", output);
 
-    rule_keep_del[0] = iptables_command + "-D INPUT " + rule_keep[0];
+    rule_keep_del[0][0] = iptables_command + "-D INPUT " + rule_keep[0][0];
 
-    run_command(rule_keep_del[0], output, show_none);
-    run_command(rule_keep_del[0], output, show_none);
+    run_command(rule_keep_del[0][0], output, show_none);
+    run_command(rule_keep_del[0][0], output, show_none);
 
-    if (run_command(rule_keep_add[0], output) != 0) {
-        mylog(log_fatal, "auto added iptables failed by: %s\n", rule_keep_add[0].c_str());
+    if (run_command(rule_keep_add[0][0], output) != 0) {
+        mylog(log_fatal, "auto added iptables failed by: %s\n", rule_keep_add[0][0].c_str());
         myexit(-1);
     }
     return 0;
 }
-int iptables_rule_init(const char *s, u32_t const_id, int keep) {
+int iptables_rule_init(const char *s, u32_t const_id, int keep, int spec_idx) {
     iptables_pattern = s;
     iptables_rule_added = 1;
     iptables_rule_keeped = keep;
@@ -1204,29 +1287,29 @@ int iptables_rule_init(const char *s, u32_t const_id, int keep) {
     char const_id_str[100];
     sprintf(const_id_str, "%x", const_id);
 
-    chain[0] = dummy + "udp2rawDwrW_" + const_id_str + "_C0";
-    chain[1] = dummy + "udp2rawDwrW_" + const_id_str + "_C1";
+    chain[spec_idx][0] = dummy + "udp2rawDwrW_" + const_id_str + "_C" + to_string(spec_idx) + "0";
+    chain[spec_idx][1] = dummy + "udp2rawDwrW_" + const_id_str + "_C" + to_string(spec_idx) + "1";
 
-    rule_keep[0] = dummy + iptables_pattern + " -j " + chain[0];
-    rule_keep[1] = dummy + iptables_pattern + " -j " + chain[1];
+    rule_keep[spec_idx][0] = dummy + iptables_pattern + " -j " + chain[spec_idx][0];
+    rule_keep[spec_idx][1] = dummy + iptables_pattern + " -j " + chain[spec_idx][1];
 
-    rule_keep_add[0] = iptables_command + "-I INPUT " + rule_keep[0];
-    rule_keep_add[1] = iptables_command + "-I INPUT " + rule_keep[1];
+    rule_keep_add[spec_idx][0] = iptables_command + "-I INPUT " + rule_keep[spec_idx][0];
+    rule_keep_add[spec_idx][1] = iptables_command + "-I INPUT " + rule_keep[spec_idx][1];
 
-    rule_keep_del[0] = iptables_command + "-D INPUT " + rule_keep[0];
-    rule_keep_del[1] = iptables_command + "-D INPUT " + rule_keep[1];
+    rule_keep_del[spec_idx][0] = iptables_command + "-D INPUT " + rule_keep[spec_idx][0];
+    rule_keep_del[spec_idx][1] = iptables_command + "-D INPUT " + rule_keep[spec_idx][1];
 
     keep_rule_last_time = get_current_time();
 
     char *output;
 
     for (int i = 0; i <= iptables_rule_keeped; i++) {
-        run_command(iptables_command + "-N " + chain[i], output);
-        run_command(iptables_command + "-F " + chain[i], output);
-        run_command(iptables_command + "-I " + chain[i] + " -j DROP", output);
+        run_command(iptables_command + "-N " + chain[spec_idx][i], output);
+        run_command(iptables_command + "-F " + chain[spec_idx][i], output);
+        run_command(iptables_command + "-I " + chain[spec_idx][i] + " -j DROP", output);
 
-        if (run_command(rule_keep_add[i], output) != 0) {
-            mylog(log_fatal, "auto added iptables failed by: %s\n", rule_keep_add[i].c_str());
+        if (run_command(rule_keep_add[spec_idx][i], output) != 0) {
+            mylog(log_fatal, "auto added iptables failed by: %s\n", rule_keep_add[spec_idx][i].c_str());
             myexit(-1);
         }
     }
@@ -1259,21 +1342,23 @@ int keep_iptables_rule()  // magic to work on a machine without grep/iptables --
 
     int i = iptables_rule_keep_index;
 
-    run_command(iptables_command + "-N " + chain[i], output, show_none);
+    for (int s = 0; s < listen_spec_cnt; s++) {
+        run_command(spec_cmd[s] + "-N " + chain[s][i], output, show_none);
 
-    if (run_command(iptables_command + "-F " + chain[i], output, show_none) != 0)
-        mylog(log_warn, "iptables -F failed %d\n", i);
+        if (run_command(spec_cmd[s] + "-F " + chain[s][i], output, show_none) != 0)
+            mylog(log_warn, "iptables -F failed %d\n", i);
 
-    if (run_command(iptables_command + "-I " + chain[i] + " -j DROP", output, show_none) != 0)
-        mylog(log_warn, "iptables -I failed %d\n", i);
+        if (run_command(spec_cmd[s] + "-I " + chain[s][i] + " -j DROP", output, show_none) != 0)
+            mylog(log_warn, "iptables -I failed %d\n", i);
 
-    if (run_command(rule_keep_del[i], output, show_none) != 0)
-        mylog(log_warn, "rule_keep_del failed %d\n", i);
+        if (run_command(rule_keep_del[s][i], output, show_none) != 0)
+            mylog(log_warn, "rule_keep_del failed %d\n", i);
 
-    run_command(rule_keep_del[i], output, show_none);  // do it twice,incase it fails for unknown random reason
+        run_command(rule_keep_del[s][i], output, show_none);  // do it twice,incase it fails for unknown random reason
 
-    if (run_command(rule_keep_add[i], output, show_log) != 0)
-        mylog(log_warn, "rule_keep_del failed %d\n", i);
+        if (run_command(rule_keep_add[s][i], output, show_log) != 0)
+            mylog(log_warn, "rule_keep_add failed %d\n", i);
+    }
 
     mylog(log_debug, "keep_iptables_rule end %llu\n", get_current_time());
     return 0;
@@ -1288,8 +1373,8 @@ int client_rotate_iptables_rule(int new_port) {
 
     char *output;
     for (int i = 0; i <= iptables_rule_keeped; i++) {
-        run_command(rule_keep_del[i], output, show_none);
-        run_command(rule_keep_del[i], output, show_none);  // twice, same as keep_iptables_rule
+        run_command(rule_keep_del[0][i], output, show_none);
+        run_command(rule_keep_del[0][i], output, show_none);  // twice, same as keep_iptables_rule
     }
 
     char tmp_pattern[200];
@@ -1310,10 +1395,10 @@ int client_rotate_iptables_rule(int new_port) {
 
     string dummy = "";
     for (int i = 0; i <= iptables_rule_keeped; i++) {
-        rule_keep[i] = dummy + iptables_pattern + " -j " + chain[i];
-        rule_keep_add[i] = iptables_command + "-I INPUT " + rule_keep[i];
-        rule_keep_del[i] = iptables_command + "-D INPUT " + rule_keep[i];
-        if (run_command(rule_keep_add[i], output, show_log) != 0) {
+        rule_keep[0][i] = dummy + iptables_pattern + " -j " + chain[0][i];
+        rule_keep_add[0][i] = iptables_command + "-I INPUT " + rule_keep[0][i];
+        rule_keep_del[0][i] = iptables_command + "-D INPUT " + rule_keep[0][i];
+        if (run_command(rule_keep_add[0][i], output, show_log) != 0) {
             mylog(log_warn, "rotate: failed to add iptables rule for new port %d\n", new_port);
             return -1;
         }
@@ -1387,10 +1472,12 @@ int clear_iptables_rule() {
     string dummy = "";
     if (!iptables_rule_added) return 0;
 
-    for (int i = 0; i <= iptables_rule_keeped; i++) {
-        run_command(rule_keep_del[i], output);
-        run_command(iptables_command + "-F " + chain[i], output);
-        run_command(iptables_command + "-X " + chain[i], output);
+    for (int s = 0; s < listen_spec_cnt; s++) {
+        for (int i = 0; i <= iptables_rule_keeped; i++) {
+            run_command(rule_keep_del[s][i], output);
+            run_command(spec_cmd[s] + "-F " + chain[s][i], output);
+            run_command(spec_cmd[s] + "-X " + chain[s][i], output);
+        }
     }
     return 0;
 }

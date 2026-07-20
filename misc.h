@@ -141,6 +141,19 @@ extern char rotate_dst_list[2000];  // --rotate-dst <addr1,addr2,...>: destinati
 int client_rotate_iptables_rule(int new_port);  // move the -a INPUT-drop rule to the new remote port
 int client_rotate_v6_source();                  // swap the source address to a fresh /128 in the prefix
 
+// multi-listen (server side): -l is the primary listen spec, --l2 adds more
+// (e.g. -l 0.0.0.0:6000-6030 --l2 [::]:6100-6107). One process then serves
+// every spec (see create_listen_sock in network.cpp).
+struct listen_spec_t {
+    address_t addr;
+    int port_min;
+    int port_max;
+};
+#define MAX_LISTEN_SPECS 4
+extern listen_spec_t listen_specs[MAX_LISTEN_SPECS];
+extern int listen_spec_cnt;
+int parse_listen_spec(const char *str, listen_spec_t &spec);
+
 extern raw_mode_t raw_mode;
 extern u32_t raw_ip_version;
 
@@ -168,7 +181,7 @@ int add_iptables_rule(const char *);
 int clear_iptables_rule();
 
 int iptables_gen_add(const char *s, u32_t const_id);
-int iptables_rule_init(const char *s, u32_t const_id, int keep);
+int iptables_rule_init(const char *s, u32_t const_id, int keep, int spec_idx);
 int keep_iptables_rule();
 
 void signal_handler(int sig);

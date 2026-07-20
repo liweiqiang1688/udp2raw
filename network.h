@@ -14,8 +14,29 @@ extern int use_tcp_dummy_socket;
 extern int seq_mode;
 extern int max_seq_mode;
 extern int filter_port;
+extern int filter_port_max;  // upper bound when listening on a port range; == filter_port for a single port
 // extern u32_t bind_address_uint32;
 extern int disable_bpf_filter;
+
+// multi-listen (server side): one process serving several listen specs —
+// e.g. v4 0.0.0.0:6000-6030 plus v6 [::]:6100-6107. Each spec owns a raw
+// send socket (family-matched) and a PF_PACKET recv socket with a BPF
+// port-range filter. On every dispatch the global raw_recv_fd/raw_send_fd/
+// raw_ip_version are swapped to the firing spec (single-threaded ev loop).
+struct listen_sock_t {
+    int recv_fd;
+    int send_fd;
+    int family;  // AF_INET / AF_INET6
+    int port_min;
+    int port_max;
+};
+#define MAX_LISTEN_SOCKS 4
+extern listen_sock_t listen_socks[MAX_LISTEN_SOCKS];
+extern int listen_sock_cnt;
+int create_listen_sock(int family, int port_min, int port_max);              // returns index or -1
+int attach_range_filter(int fd, int family, int port_min, int port_max);      // BPF portrange on an existing fd
+int use_listen_sock_by_index(int idx);                                       // swap globals to spec
+int use_listen_sock_for_port(int port);                                      // swap globals to the spec owning port
 
 extern int lower_level;
 extern int lower_level_manual;

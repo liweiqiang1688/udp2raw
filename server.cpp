@@ -598,6 +598,11 @@ int server_on_udp_recv(conn_info_t &conn_info, fd64_t fd64) {
     // conn_info.conv_manager->update_active_time(conv_id);  server dosnt update from upd side,only update from raw side.  (client updates at both side)
 
     if (conn_info.state.server_current_state == server_ready) {
+#ifdef UDP2RAW_LINUX
+        // pick the listen socket this connection lives on (its server-side
+        // port) so the raw reply goes out with the right family/socket
+        use_listen_sock_for_port(conn_info.raw_info.send_info.src_port);
+#endif
         send_data_safer(conn_info, buf, recv_len, conv_id);
         // send_data(g_packet_info_send,buf,recv_len,my_id,oppsite_id,conv_id);
         mylog(log_trace, "send_data_safer ,sent !!\n");
@@ -663,7 +668,33 @@ int server_event_loop() {
     }
 
     // init_raw_socket();
-    init_filter(local_addr.get_port());  // bpf filter
+#ifdef UDP2RAW_LINUX
+    // Multi-listen: one process serving every -l/--l2 spec. Spec 0 reuses the
+    // raw sockets from init_raw_socket() with a (possibly ranged) BPF filter;
+    // extra specs get raw sockets of their own.
+    {
+        listen_sock_t &ls0 = listen_socks[0];
+        ls0.recv_fd = raw_recv_fd;
+        ls0.send_fd = raw_send_fd;
+        ls0.family = raw_ip_version;
+        ls0.port_min = listen_specs[0].port_min;
+        ls0.port_max = listen_specs[0].port_max;
+        listen_sock_cnt = 1;
+        if (ls0.port_max > ls0.port_min) {
+            attach_range_filter(raw_recv_fd, raw_ip_version, ls0.port_min, ls0.port_max);
+        } else {
+            init_filter(ls0.port_min);
+        }
+        filter_port = ls0.port_min;
+        filter_port_max = ls0.port_max;
+    }
+    for (int s = 1; s < listen_spec_cnt; s++) {
+        if (create_listen_sock(listen_specs[s].addr.get_type(), listen_specs[s].port_min, listen_specs[s].port_max) < 0)
+            myexit(-1);
+    }
+#else
+    init_filter(listen_specs[0].port_min);  // bpf filter
+#endif
 
     epollfd = epoll_create1(0);
     const int max_events = 4096;
@@ -675,13 +706,24 @@ int server_event_loop() {
     }
 
     ev.events = EPOLLIN;
+#ifdef UDP2RAW_LINUX
+    // register every listen spec's recv fd (spec 0 = the original raw_recv_fd)
+    for (int s = 0; s < listen_sock_cnt; s++) {
+        ev.data.u64 = listen_socks[s].recv_fd;
+        ret = epoll_ctl(epollfd, EPOLL_CTL_ADD, listen_socks[s].recv_fd, &ev);
+        if (ret != 0) {
+            mylog(log_fatal, "add listen recv_fd error (spec %d)\n", s);
+            myexit(-1);
+        }
+    }
+#else
     ev.data.u64 = raw_recv_fd;
-
     ret = epoll_ctl(epollfd, EPOLL_CTL_ADD, raw_recv_fd, &ev);
     if (ret != 0) {
         mylog(log_fatal, "add raw_fd error\n");
         myexit(-1);
     }
+#endif
     int timer_fd;
 
     set_timer(epollfd, timer_fd);
@@ -689,7 +731,14 @@ int server_event_loop() {
     u64_t begin_time = 0;
     u64_t end_time = 0;
 
-    mylog(log_info, "now listening at %s\n", local_addr.get_str());
+    for (int s = 0; s < listen_spec_cnt; s++) {
+        char pstr[40];
+        if (listen_specs[s].port_min == listen_specs[s].port_max)
+            snprintf(pstr, sizeof(pstr), "%d", listen_specs[s].port_min);
+        else
+            snprintf(pstr, sizeof(pstr), "%d-%d", listen_specs[s].port_min, listen_specs[s].port_max);
+        mylog(log_info, "now listening at %s (ports %s)\n", listen_specs[s].addr.get_ip(), pstr);
+    }
 
     int fifo_fd = -1;
 
@@ -738,15 +787,28 @@ int server_event_loop() {
 
                 mylog(log_trace, "epoll_trigger_counter:  %d \n", epoll_trigger_counter);
                 epoll_trigger_counter = 0;
-
-            } else if (events[idx].data.u64 == (u64_t)raw_recv_fd) {
-                if (debug_flag) begin_time = get_current_time();
-                server_on_raw_recv_multi();
-                if (debug_flag) {
-                    end_time = get_current_time();
-                    mylog(log_debug, "raw_recv_fd,%llu,%llu,%llu  \n", begin_time, end_time, end_time - begin_time);
+                continue;  // timer event handled — don't fall into the later branches
+            }
+#ifdef UDP2RAW_LINUX
+            // a listen spec's recv fd fired: swap the globals to that spec
+            // (single-threaded loop) and handle its packets
+            bool is_listen_ev = false;
+            for (int s = 0; s < listen_sock_cnt; s++) {
+                if (events[idx].data.u64 == (u64_t)listen_socks[s].recv_fd) {
+                    use_listen_sock_by_index(s);
+                    if (debug_flag) begin_time = get_current_time();
+                    server_on_raw_recv_multi();
+                    if (debug_flag) {
+                        end_time = get_current_time();
+                        mylog(log_debug, "raw_recv_fd(spec %d),%llu,%llu,%llu  \n", s, begin_time, end_time, end_time - begin_time);
+                    }
+                    is_listen_ev = true;
+                    break;
                 }
-            } else if (events[idx].data.u64 == (u64_t)fifo_fd) {
+            }
+            if (is_listen_ev) continue;
+#endif
+            if (events[idx].data.u64 == (u64_t)fifo_fd) {
                 int len = read(fifo_fd, buf, sizeof(buf));
                 if (len < 0) {
                     mylog(log_warn, "fifo read failed len=%d,errno=%s\n", len, strerror(errno));

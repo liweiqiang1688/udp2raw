@@ -21,6 +21,7 @@ int max_seq_mode = 4;
 int random_drop = 0;
 
 int filter_port = -1;
+int filter_port_max = -1;
 
 int disable_bpf_filter = 0;  // for test only,most time no need to disable this
 
@@ -716,6 +717,166 @@ void init_filter(int port) {
         // perror("filter");
         myexit(-1);
     }
+}
+
+//————— multi-listen (server side) —————
+// Range BPF programs: "tcp dst portrange min-max" as classic BPF — JGE min
+// then JGT max (there is no JLE in classic BPF), same shape as the
+// single-port programs above. Jump offsets are relative to next insn:
+//   idx6: JGE min, jt=0 -> idx7, jf=2 -> idx9 (ret 0)
+//   idx7: JGT max, jt=1 -> idx9 (ret 0), jf=0 -> idx8 (ret 0xffff)
+static struct sock_filter code_tcp_rng[] = {
+    {0x30, 0, 0, 0x00000009},
+    {0x15, 0, 6, 0x00000006},
+    {0x28, 0, 0, 0x00000006},
+    {0x45, 4, 0, 0x00001fff},
+    {0xb1, 0, 0, 0x00000000},
+    {0x48, 0, 0, 0x00000002},
+    {0x35, 0, 2, 0x0000ffff},  // JGE port_min (patched)
+    {0x25, 1, 0, 0x0000ffff},  // JGT port_max (patched)
+    {0x6, 0, 0, 0x0000ffff},
+    {0x6, 0, 0, 0x00000000},
+};
+static struct sock_filter code_tcp6_rng[] = {
+    {0x30, 0, 0, 0x00000006},
+    {0x15, 0, 3, 0x00000006},
+    {0x28, 0, 0, 0x0000002a},
+    {0x35, 0, 2, 0x0000ffff},  // JGE port_min (patched)
+    {0x25, 1, 0, 0x0000ffff},  // JGT port_max (patched)
+    {0x6, 0, 0, 0x00040000},
+    {0x6, 0, 0, 0x00000000},
+};
+static struct sock_filter code_udp_rng[] = {
+    {0x30, 0, 0, 0x00000009},
+    {0x15, 0, 6, 0x00000011},
+    {0x28, 0, 0, 0x00000006},
+    {0x45, 4, 0, 0x00001fff},
+    {0xb1, 0, 0, 0x00000000},
+    {0x48, 0, 0, 0x00000002},
+    {0x35, 0, 2, 0x0000ffff},
+    {0x25, 1, 0, 0x0000ffff},
+    {0x6, 0, 0, 0x0000ffff},
+    {0x6, 0, 0, 0x00000000},
+};
+static struct sock_filter code_udp6_rng[] = {
+    {0x30, 0, 0, 0x00000006},
+    {0x15, 0, 3, 0x00000011},
+    {0x28, 0, 0, 0x0000002a},
+    {0x35, 0, 2, 0x0000ffff},
+    {0x25, 1, 0, 0x0000ffff},
+    {0x6, 0, 0, 0x00040000},
+    {0x6, 0, 0, 0x00000000},
+};
+
+listen_sock_t listen_socks[MAX_LISTEN_SOCKS];
+int listen_sock_cnt = 0;
+
+// Attach a "tcp/udp dst portrange min-max" BPF to an existing recv fd.
+int attach_range_filter(int fd, int family, int port_min, int port_max) {
+    if (disable_bpf_filter || raw_mode == mode_icmp) return 0;
+    sock_fprog bpf;
+    struct sock_filter *prog;
+    if (raw_mode == mode_faketcp) {
+        prog = (family == AF_INET) ? code_tcp_rng : code_tcp6_rng;
+        bpf.len = (family == AF_INET) ? sizeof(code_tcp_rng) / sizeof(code_tcp_rng[0])
+                                      : sizeof(code_tcp6_rng) / sizeof(code_tcp6_rng[0]);
+    } else {
+        prog = (family == AF_INET) ? code_udp_rng : code_udp6_rng;
+        bpf.len = (family == AF_INET) ? sizeof(code_udp_rng) / sizeof(code_udp_rng[0])
+                                      : sizeof(code_udp6_rng) / sizeof(code_udp6_rng[0]);
+    }
+    int min_idx = (family == AF_INET) ? 6 : 3;
+    int max_idx = (family == AF_INET) ? 7 : 4;
+    prog[min_idx].k = port_min;
+    prog[max_idx].k = port_max;
+    bpf.filter = prog;
+    int dummy = 0;
+    setsockopt(fd, SOL_SOCKET, SO_DETACH_FILTER, &dummy, sizeof(dummy));
+    if (setsockopt(fd, SOL_SOCKET, SO_ATTACH_FILTER, &bpf, sizeof(bpf)) != 0) {
+        mylog(log_fatal, "error setting port-range filter\n");
+        return -1;
+    }
+    return 0;
+}
+
+// Create one listen spec: a family-matched raw send socket plus a PF_PACKET
+// recv socket with a BPF port-range filter attached. Mirrors the socket
+// setup in init_raw_socket(), but parameterized by family and port range.
+int create_listen_sock(int family, int port_min, int port_max) {
+    assert(family == AF_INET || family == AF_INET6);
+    assert(port_min > 0 && port_max >= port_min && port_max <= 65535);
+    if (listen_sock_cnt >= MAX_LISTEN_SOCKS) {
+        mylog(log_fatal, "too many listen sockets (max %d)\n", MAX_LISTEN_SOCKS);
+        return -1;
+    }
+    int idx = listen_sock_cnt++;
+    listen_sock_t *ls = &listen_socks[idx];
+    ls->family = family;
+    ls->port_min = port_min;
+    ls->port_max = port_max;
+
+    ls->send_fd = socket(family, SOCK_RAW, IPPROTO_RAW);
+    if (ls->send_fd == -1) {
+        mylog(log_fatal, "Failed to create listen send fd\n");
+        return -1;
+    }
+    int opt = 0;
+    setsockopt(ls->send_fd, SOL_SOCKET, SO_RCVBUF, &opt, sizeof(opt));  // send-only
+    if (force_socket_buf) {
+        setsockopt(ls->send_fd, SOL_SOCKET, SO_SNDBUFFORCE, &socket_buf_size, sizeof(socket_buf_size));
+    } else {
+        setsockopt(ls->send_fd, SOL_SOCKET, SO_SNDBUF, &socket_buf_size, sizeof(socket_buf_size));
+    }
+
+    ls->recv_fd = socket(PF_PACKET, SOCK_DGRAM, htons(family == AF_INET ? ETH_P_IP : ETH_P_IPV6));
+    if (ls->recv_fd == -1) {
+        mylog(log_fatal, "Failed to create listen recv fd\n");
+        return -1;
+    }
+    if (strlen(dev) != 0) {
+        struct sockaddr_ll bind_address;
+        memset(&bind_address, 0, sizeof(bind_address));
+        int index = -1;
+        assert(init_ifindex(dev, ls->recv_fd, index) == 0);
+        bind_address.sll_family = AF_PACKET;
+        bind_address.sll_protocol = htons(family == AF_INET ? ETH_P_IP : ETH_P_IPV6);
+        bind_address.sll_ifindex = index;
+        if (bind(ls->recv_fd, (struct sockaddr *)&bind_address, sizeof(bind_address)) == -1) {
+            mylog(log_fatal, "bind listen recv fd to dev [%s] failed\n", dev);
+            return -1;
+        }
+    }
+    if (force_socket_buf) {
+        setsockopt(ls->recv_fd, SOL_SOCKET, SO_RCVBUFFORCE, &socket_buf_size, sizeof(socket_buf_size));
+    } else {
+        setsockopt(ls->recv_fd, SOL_SOCKET, SO_RCVBUF, &socket_buf_size, sizeof(socket_buf_size));
+    }
+    setnonblocking(ls->send_fd);
+    setnonblocking(ls->recv_fd);
+
+    if (attach_range_filter(ls->recv_fd, family, port_min, port_max) != 0)
+        return -1;
+    mylog(log_info, "listen socket created: family=%s ports %d-%d (recv_fd=%d)\n",
+          family == AF_INET ? "ipv4" : "ipv6", port_min, port_max, ls->recv_fd);
+    return idx;
+}
+
+int use_listen_sock_by_index(int idx) {
+    if (idx < 0 || idx >= listen_sock_cnt) return -1;
+    raw_recv_fd = listen_socks[idx].recv_fd;
+    raw_send_fd = listen_socks[idx].send_fd;
+    raw_ip_version = listen_socks[idx].family;
+    filter_port = listen_socks[idx].port_min;
+    filter_port_max = listen_socks[idx].port_max;
+    return 0;
+}
+
+int use_listen_sock_for_port(int port) {
+    for (int i = 0; i < listen_sock_cnt; i++) {
+        if (port >= listen_socks[i].port_min && port <= listen_socks[i].port_max)
+            return use_listen_sock_by_index(i);
+    }
+    return -1;
 }
 #endif
 
@@ -2043,9 +2204,12 @@ int recv_raw_udp(raw_info_t &raw_info, char *&payload, int &payloadlen) {
         return -1;
     }
 
-    if (udph->dest != ntohs(uint16_t(filter_port))) {
-        // printf("%x %x",tcph->dest,);
-        return -1;
+    {
+        u16_t dport = ntohs(udph->dest);
+        if (dport != ntohs(uint16_t(filter_port)) && (filter_port_max < 0 || dport < filter_port || dport > filter_port_max)) {
+            // printf("%x %x",tcph->dest,);
+            return -1;
+        }
     }
 
     // memcpy(recv_raw_udp_buf+ sizeof(struct pseudo_header) , ip_payload , ip_payloadlen);
@@ -2196,9 +2360,12 @@ int recv_raw_tcp(raw_info_t &raw_info, char *&payload, int &payloadlen) {
         return 0;
     }
 
-    if (tcph->dest != ntohs(uint16_t(filter_port))) {
-        // printf("%x %x",tcph->dest,);
-        return -1;
+    {
+        u16_t dport = ntohs(tcph->dest);
+        if (dport != ntohs(uint16_t(filter_port)) && (filter_port_max < 0 || dport < filter_port || dport > filter_port_max)) {
+            // printf("%x %x",tcph->dest,);
+            return -1;
+        }
     }
 
     // memcpy(recv_raw_tcp_buf+ sizeof(struct pseudo_header) , ip_payload , ip_payloadlen);
@@ -2409,8 +2576,8 @@ int recv_raw_tcp_deprecated(packet_info_t &info,char * &payload,int &payloadlen)
     }
 
 
-    if(tcph->dest!=ntohs(uint16_t(filter_port)))
-    {
+    u16_t dport = ntohs(tcph->dest);
+    if (dport != ntohs(uint16_t(filter_port)) && (filter_port_max < 0 || dport < filter_port || dport > filter_port_max)) {
         //printf("%x %x",tcph->dest,);
         return -1;
     }
