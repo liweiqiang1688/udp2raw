@@ -1442,9 +1442,7 @@ int client_rotate_v6_source() {
         v6_prefix_parsed = 1;
     }
     struct in6_addr addr = v6_prefix_bin;
-    addr.s6_addr[8] = 0xce;
-    addr.s6_addr[9] = 0xc1;
-    for (int i = 10; i < 16; i++)
+    for (int i = 8; i < 16; i++)
         addr.s6_addr[i] = (uint8_t)(get_true_random_number() & 0xff);
     char new_addr[100];
     inet_ntop(AF_INET6, &addr, new_addr, sizeof(new_addr));
