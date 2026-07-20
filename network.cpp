@@ -2205,8 +2205,8 @@ int recv_raw_udp(raw_info_t &raw_info, char *&payload, int &payloadlen) {
     }
 
     {
-        u16_t dport = ntohs(udph->dest);
-        if (dport != ntohs(uint16_t(filter_port)) && (filter_port_max < 0 || dport < filter_port || dport > filter_port_max)) {
+        u16_t dport = ntohs(udph->dest);  // all host order: filter_port/filter_port_max are host order too
+        if (dport != (u16_t)filter_port && (filter_port_max < 0 || dport < (u16_t)filter_port || dport > (u16_t)filter_port_max)) {
             // printf("%x %x",tcph->dest,);
             return -1;
         }
@@ -2362,7 +2362,7 @@ int recv_raw_tcp(raw_info_t &raw_info, char *&payload, int &payloadlen) {
 
     {
         u16_t dport = ntohs(tcph->dest);
-        if (dport != ntohs(uint16_t(filter_port)) && (filter_port_max < 0 || dport < filter_port || dport > filter_port_max)) {
+        if (dport != (u16_t)filter_port && (filter_port_max < 0 || dport < (u16_t)filter_port || dport > (u16_t)filter_port_max)) {
             // printf("%x %x",tcph->dest,);
             return -1;
         }
@@ -2577,7 +2577,7 @@ int recv_raw_tcp_deprecated(packet_info_t &info,char * &payload,int &payloadlen)
 
 
     u16_t dport = ntohs(tcph->dest);
-    if (dport != ntohs(uint16_t(filter_port)) && (filter_port_max < 0 || dport < filter_port || dport > filter_port_max)) {
+    if (dport != (u16_t)filter_port && (filter_port_max < 0 || dport < (u16_t)filter_port || dport > (u16_t)filter_port_max)) {
         //printf("%x %x",tcph->dest,);
         return -1;
     }
