@@ -126,6 +126,7 @@ extern char fifo_file[1000];
 extern u64_t rotate_bytes;       // --rotate-bytes: payload bytes per flow, 0=disabled
 extern int rotate_jitter;        // --rotate-jitter: ±percent jitter on the threshold
 extern int rotate_min_interval;  // --rotate-min-interval: min seconds between rotations
+extern int rotate_max_interval;  // --rotate-max-interval: force rotation every N seconds (0=off)
 extern int rotate_port_min;      // --rotate-ports start:end; 0:0 = stay on the -r port
 extern int rotate_port_max;
 // IPv6 source rotation: on every rotation, pick a fresh random interface-ID

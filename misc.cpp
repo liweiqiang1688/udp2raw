@@ -71,6 +71,7 @@ char fifo_file[1000] = "";
 u64_t rotate_bytes = 0;  // --rotate-bytes: rotate remote port after N payload bytes (client only, 0=disabled)
 int rotate_jitter = 40;
 int rotate_min_interval = 20;
+int rotate_max_interval = 0;
 int rotate_port_min = 0, rotate_port_max = 0;
 char rotate_v6_prefix[100] = "";
 char rotate_v6_dev[32] = "";
@@ -215,6 +216,7 @@ void print_help() {
     printf("                                          flow accumulates enough volume to get throttled\n");
     printf("    --rotate-jitter       <number>        ±percent jitter on the --rotate-bytes threshold,0-90,default:40\n");
     printf("    --rotate-min-interval <number>        minimum seconds between two rotations,default:20\n");
+    printf("    --rotate-max-interval <number>        force rotation every N seconds regardless of bytes,default:0(off)\n");
     printf("    --rotate-ports        <start:end>     remote port range to rotate into,e.g. 6000:6030.\n");
     printf("                                          default: reconnect to the same -r port (still a new 5-tuple)\n");
     printf("    --rotate-v6-prefix    <addr>/64       also rotate the source address: on every rotation add a\n");
@@ -376,6 +378,7 @@ void process_arg(int argc, char *argv[])  // process all options
             {"rotate-bytes", required_argument, 0, 1},
             {"rotate-jitter", required_argument, 0, 1},
             {"rotate-min-interval", required_argument, 0, 1},
+            {"rotate-max-interval", required_argument, 0, 1},
             {"rotate-ports", required_argument, 0, 1},
             {"rotate-v6-prefix", required_argument, 0, 1},
             {"rotate-v6-dev", required_argument, 0, 1},
@@ -771,6 +774,10 @@ void process_arg(int argc, char *argv[])  // process all options
                     sscanf(optarg, "%d", &rotate_min_interval);
                     assert(rotate_min_interval >= 0);
                     mylog(log_info, "rotate_min_interval=%d \n", rotate_min_interval);
+                } else if (strcmp(long_options[option_index].name, "rotate-max-interval") == 0) {
+                    sscanf(optarg, "%d", &rotate_max_interval);
+                    assert(rotate_max_interval >= 0);
+                    mylog(log_info, "rotate_max_interval=%d \n", rotate_max_interval);
                 } else if (strcmp(long_options[option_index].name, "rotate-ports") == 0) {
                     sscanf(optarg, "%d:%d", &rotate_port_min, &rotate_port_max);
                     assert(rotate_port_min > 0 && rotate_port_min <= 65535);

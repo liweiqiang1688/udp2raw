@@ -413,9 +413,15 @@ static void client_rotate_account(conn_info_t &conn_info, int payload_bytes) {
     if (rotate_bytes == 0) return;
     if (conn_info.state.client_current_state != client_ready) return;
     rotate_bytes_counter += (u64_t)payload_bytes;
-    if (rotate_bytes_counter < rotate_next_threshold) return;
-    if (get_current_time() - rotate_last_time < (u64_t)rotate_min_interval * 1000) return;
-    client_rotate_port(conn_info, "bytes threshold");
+
+    u64_t elapsed = get_current_time() - rotate_last_time;
+    int max_seconds = rotate_max_interval > 0 ? rotate_max_interval : rotate_min_interval;  // fallback: use min as max when unset
+    int time_triggered = (rotate_max_interval > 0 && elapsed >= (u64_t)max_seconds * 1000);
+    int bytes_triggered = (rotate_bytes_counter >= rotate_next_threshold && elapsed >= (u64_t)rotate_min_interval * 1000);
+
+    if (!time_triggered && !bytes_triggered) return;
+
+    client_rotate_port(conn_info, bytes_triggered ? "bytes threshold" : "max interval");
 }
 
 int client_on_raw_recv_hs2_or_ready(conn_info_t &conn_info, char type, char *data, int data_len) {
@@ -923,8 +929,8 @@ int client_event_loop() {
     if (rotate_bytes > 0) {
         rotate_next_threshold = rotate_pick_threshold();
         rotate_last_time = get_current_time();
-        mylog(log_info, "client port rotation enabled: threshold=%llu bytes (base %llu, jitter ±%d%%), min_interval=%ds, port range=%d:%d\n",
-              rotate_next_threshold, (unsigned long long)rotate_bytes, rotate_jitter, rotate_min_interval, rotate_port_min, rotate_port_max);
+        mylog(log_info, "client port rotation enabled: threshold=%llu bytes (base %llu, jitter ±%d%%), min_interval=%ds, max_interval=%ds, port range=%d:%d\n",
+              rotate_next_threshold, (unsigned long long)rotate_bytes, rotate_jitter, rotate_min_interval, rotate_max_interval, rotate_port_min, rotate_port_max);
     }
 #ifdef UDP2RAW_LINUX
     if (rotate_v6_prefix[0] != 0 && rotate_v6_dev[0] != 0) {
