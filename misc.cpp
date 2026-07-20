@@ -75,6 +75,7 @@ int rotate_port_min = 0, rotate_port_max = 0;
 char rotate_v6_prefix[100] = "";
 char rotate_v6_dev[32] = "";
 int rotate_stall = 8;
+char rotate_dst_list[2000] = "";
 
 int clear_iptables = 0;
 int wait_xtables_lock = 0;
@@ -178,6 +179,9 @@ void print_help() {
     printf("                                          seconds while ready (escapes clamp-to-zero fuses,\n");
     printf("                                          which produce no bytes and never trip --rotate-bytes).\n");
     printf("                                          default:8, 0=disabled\n");
+    printf("    --rotate-dst          <a1,a2,...>     comma-separated destination address pool (v6): every\n");
+    printf("                                          rotation also jumps to a different remote address from\n");
+    printf("                                          this list, so flows differ on all 5 tuple fields\n");
     //	printf("                                          \n");
     printf("other options:\n");
     printf("    --conf-file           <string>        read options from a configuration file instead of command line.\n");
@@ -327,6 +331,7 @@ void process_arg(int argc, char *argv[])  // process all options
             {"rotate-v6-prefix", required_argument, 0, 1},
             {"rotate-v6-dev", required_argument, 0, 1},
             {"rotate-stall", required_argument, 0, 1},
+            {"rotate-dst", required_argument, 0, 1},
             {NULL, 0, 0, 0}};
 
     process_log_level(argc, argv);
@@ -734,6 +739,9 @@ void process_arg(int argc, char *argv[])  // process all options
                     sscanf(optarg, "%d", &rotate_stall);
                     assert(rotate_stall >= 0 && rotate_stall <= 3600);
                     mylog(log_info, "rotate_stall=%d \n", rotate_stall);
+                } else if (strcmp(long_options[option_index].name, "rotate-dst") == 0) {
+                    sscanf(optarg, "%1999s", rotate_dst_list);
+                    mylog(log_info, "rotate_dst_list=%s \n", rotate_dst_list);
                 } else {
                     mylog(log_warn, "ignored unknown long option ,option_index:%d code:<%x>\n", option_index, optopt);
                 }

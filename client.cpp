@@ -358,12 +358,34 @@ static u64_t rotate_pick_threshold() {
 
 static void client_rotate_port(conn_info_t &conn_info, const char *reason) {
     packet_info_t &send_info = conn_info.raw_info.send_info;
-    int old_port = remote_addr.get_port();
-    int new_port = old_port;
+    char old_remote[150] = "";
+    snprintf(old_remote, sizeof(old_remote), "%s:%d", remote_addr.get_ip(), remote_addr.get_port());
+    int new_port = remote_addr.get_port();
     if (rotate_port_min > 0 && rotate_port_max > rotate_port_min) {
         int range = rotate_port_max - rotate_port_min + 1;
+        int old_port = new_port;
         while (new_port == old_port)
             new_port = rotate_port_min + (int)(get_true_random_number() % (u64_t)range);
+    }
+    // destination-address rotation (v6 pool): every hop lands on a different
+    // remote address, so flows differ on all 5 tuple fields
+    if (rotate_dst_list[0] != 0 && remote_addr.get_type() == AF_INET6) {
+        char buf[2000];
+        snprintf(buf, sizeof(buf), "%s", rotate_dst_list);
+        vector<string> cands;
+        char *save = nullptr;
+        for (char *p = strtok_r(buf, ",", &save); p != nullptr; p = strtok_r(nullptr, ",", &save))
+            if (strcmp(p, remote_addr.get_ip()) != 0) cands.push_back(p);
+        if (!cands.empty()) {
+            const string &pick = cands[get_true_random_number() % (u64_t)cands.size()];
+            char full[150];
+            snprintf(full, sizeof(full), "[%s]:%d", pick.c_str(), new_port);
+            remote_addr.from_str(full);
+        } else {
+            remote_addr.set_port(new_port);
+        }
+    } else {
+        remote_addr.set_port(new_port);
     }
     u64_t rotated_bytes = rotate_bytes_counter;
     rotate_bytes_counter = 0;
@@ -373,16 +395,17 @@ static void client_rotate_port(conn_info_t &conn_info, const char *reason) {
     stall_win_bytes = 0;
 
 #ifdef UDP2RAW_LINUX
+    // the -a rule matches the REMOTE ip — swap it only after remote_addr has
+    // been updated, or the kernel would RST the new connection
     client_rotate_iptables_rule(new_port);
     client_rotate_v6_source();
 #endif
-    remote_addr.set_port(new_port);
     send_info.new_dst_ip.from_address_t(remote_addr);
     send_info.dst_port = new_port;
     conn_info.state.client_current_state = client_idle;
     conn_info.my_id = get_true_random_number_nz();
-    mylog(log_info, "port rotation (%s): remote port %d -> %d after %llu payload bytes, next threshold %llu\n",
-          reason, old_port, new_port, rotated_bytes, rotate_next_threshold);
+    mylog(log_info, "port rotation (%s): remote %s -> %s:%d after %llu payload bytes, next threshold %llu\n",
+          reason, old_remote, remote_addr.get_ip(), new_port, rotated_bytes, rotate_next_threshold);
     client_on_timer(conn_info);  // re-bind + re-handshake now, don't wait a timer tick
 }
 

@@ -136,6 +136,7 @@ extern int rotate_port_max;
 extern char rotate_v6_prefix[100];  // --rotate-v6-prefix <addr>/64
 extern char rotate_v6_dev[32];      // --rotate-v6-dev <wan-ifname>
 extern int rotate_stall;            // --rotate-stall <sec>: rotate if uplink <64KB over this window (0=off)
+extern char rotate_dst_list[2000];  // --rotate-dst <addr1,addr2,...>: destination v6 pool to rotate through
 
 int client_rotate_iptables_rule(int new_port);  // move the -a INPUT-drop rule to the new remote port
 int client_rotate_v6_source();                  // swap the source address to a fresh /128 in the prefix
