@@ -406,7 +406,8 @@ static void client_rotate_port(conn_info_t &conn_info, const char *reason) {
     conn_info.my_id = get_true_random_number_nz();
     mylog(log_info, "port rotation (%s): remote %s -> %s:%d after %llu payload bytes, next threshold %llu\n",
           reason, old_remote, remote_addr.get_ip(), new_port, rotated_bytes, rotate_next_threshold);
-    client_on_timer(conn_info);  // re-bind + re-handshake now, don't wait a timer tick
+    client_on_timer(conn_info);  // re-bind + transition to client_handshake1
+    client_on_timer(conn_info);  // immediately send handshake1 (saves one timer tick)
 }
 
 static void client_rotate_account(conn_info_t &conn_info, int payload_bytes) {
