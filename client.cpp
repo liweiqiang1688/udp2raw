@@ -435,7 +435,16 @@ static void client_rotate_port(conn_info_t &conn_info, const char *reason) {
 
     // Create and bind a new UDP socket with the rotated source address
     pre.udp_fd = socket(local_addr.get_type(), SOCK_DGRAM, IPPROTO_UDP);
-    if (pre.udp_fd < 0) goto fallback;
+    if (pre.udp_fd < 0) {
+        pre.reset();
+        send_info.new_dst_ip.from_address_t(remote_addr);
+        send_info.dst_port = new_port;
+        conn_info.state.client_current_state = client_idle;
+        conn_info.my_id = get_true_random_number_nz();
+        client_on_timer(conn_info);
+        client_on_timer(conn_info);
+        return;
+    }
     setnonblocking(pre.udp_fd);
     set_buf_size(pre.udp_fd, socket_buf_size);
 
@@ -447,8 +456,16 @@ static void client_rotate_port(conn_info_t &conn_info, const char *reason) {
             bind_addr.from_str("0.0.0.0:0");
         if (force_source_ip && source_addr.get_type() == remote_addr.get_type())
             bind_addr.from_str_ip_only(source_addr.get_ip());
-        if (::bind(pre.udp_fd, (struct sockaddr *)&bind_addr.inner, bind_addr.get_len()) == -1)
-            goto fallback;
+        if (::bind(pre.udp_fd, (struct sockaddr *)&bind_addr.inner, bind_addr.get_len()) == -1) {
+            pre.reset();
+            send_info.new_dst_ip.from_address_t(remote_addr);
+            send_info.dst_port = new_port;
+            conn_info.state.client_current_state = client_idle;
+            conn_info.my_id = get_true_random_number_nz();
+            client_on_timer(conn_info);
+            client_on_timer(conn_info);
+            return;
+        }
     }
 
     // Initialize the preconnect connection state
@@ -480,16 +497,6 @@ static void client_rotate_port(conn_info_t &conn_info, const char *reason) {
 
     pre.active = 1;
     return;
-
-fallback:
-    pre.reset();
-    // Traditional immediate reconnect
-    send_info.new_dst_ip.from_address_t(remote_addr);
-    send_info.dst_port = new_port;
-    conn_info.state.client_current_state = client_idle;
-    conn_info.my_id = get_true_random_number_nz();
-    client_on_timer(conn_info);
-    client_on_timer(conn_info);
 }
 
 static void client_rotate_account(conn_info_t &conn_info, int payload_bytes) {
