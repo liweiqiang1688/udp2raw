@@ -589,7 +589,25 @@ int client_on_raw_recv(conn_info_t &conn_info)  // called when raw fd received a
             if (version == 4) {
                 udp_off = ((unsigned char)peek_buf[0] & 0x0F) * 4;
             } else if (version == 6) {
-                udp_off = 40;
+                // IPv6: walk extension headers to find the UDP header
+                int off = 40;
+                int next_hdr = (unsigned char)peek_buf[6];  // IPv6 Next Header field
+                while (off + 2 <= peek_len && next_hdr != 17) {  // 17 = UDP
+                    if (next_hdr == 0 || next_hdr == 43 || next_hdr == 44 ||
+                        next_hdr == 60 || next_hdr == 135) {
+                        // Extension header: byte 0=next, byte 1=len in 8B units
+                        if (off + 2 > peek_len) break;
+                        next_hdr = (unsigned char)peek_buf[off];
+                        int ext_len = ((unsigned char)peek_buf[off + 1] + 1) * 8;
+                        off += ext_len;
+                    } else if (next_hdr == 51 || next_hdr == 50) {
+                        // AH / ESP — can't see through, bail
+                        break;
+                    } else {
+                        break;  // unknown/unexpected next header
+                    }
+                }
+                if (next_hdr == 17) udp_off = off;
             }
             if (udp_off > 0 && peek_len >= udp_off + 4) {
                 int src_port = ((unsigned char)peek_buf[udp_off] << 8)
@@ -839,6 +857,35 @@ int client_on_raw_recv(conn_info_t &conn_info)  // called when raw fd received a
         conn_info.my_id = get_true_random_number_nz();
         client_on_timer(conn_info);
         client_on_timer(conn_info);
+    }
+
+    // If preconnect just reached client_ready during raw_recv, swap immediately
+    // rather than waiting for the next timer tick (timer_interval = 400ms).
+    if (pre.active && pre.conn.state.client_current_state == client_ready) {
+        int old_fd = udp_fd;
+        udp_fd = pre.udp_fd;
+        pre.udp_fd = -1;
+        conn_info.my_id = pre.conn.my_id;
+        conn_info.oppsite_id = pre.conn.oppsite_id;
+        memcpy(&conn_info.raw_info.send_info, &pre.conn.raw_info.send_info, sizeof(packet_info_t));
+        memcpy(&conn_info.raw_info.recv_info, &pre.conn.raw_info.recv_info, sizeof(packet_info_t));
+        conn_info.state.client_current_state = client_ready;
+        conn_info.last_hb_recv_time = get_current_time();
+        conn_info.last_hb_sent_time = 0;
+        conn_info.last_oppsite_roller_time = conn_info.last_hb_recv_time;
+        blob_t *old_blob = conn_info.blob;
+        conn_info.blob = pre.conn.blob;
+        pre.conn.blob = nullptr;
+        delete old_blob;
+        pre.reset();
+        { char d[4096]; while (recvfrom(old_fd, d, sizeof(d), MSG_DONTWAIT, nullptr, nullptr) > 0) {} }
+        sock_close(old_fd);
+        if (udp_watcher != nullptr) {
+            ev_io_stop(main_loop, udp_watcher);
+            ev_io_set(udp_watcher, udp_fd, EV_READ);
+            ev_io_start(main_loop, udp_watcher);
+        }
+        mylog(log_info, "preconnect swap (raw_recv): old fd %d → new fd %d\n", old_fd, udp_fd);
     }
 
     return 0;
