@@ -37,7 +37,9 @@ struct preconnect_t {
     void reset() {
         active = 0;
         if (udp_fd >= 0) { sock_close(udp_fd); udp_fd = -1; }
-        // conn_info_t destructor frees blob; re_init resets state without re-alloc
+        // Free the old blob before re-init (blob is allocated per rotation).
+        // conn_info_t's destructor would handle this, but we reuse the struct.
+        if (conn.blob) { delete conn.blob; conn.blob = nullptr; }
         conn.re_init();
     }
 } pre;
