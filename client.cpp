@@ -27,6 +27,26 @@ static u64_t stall_win_start = 0;   // stall-detector window start (ms)
 static u64_t stall_win_bytes = 0;   // uplink payload bytes inside the window
 static void client_rotate_port(conn_info_t &conn_info, const char *reason);
 
+//————— pre-connection state (make-before-break rotation) —————
+struct preconnect_t {
+    int active = 0;
+    conn_info_t conn;          // second connection state machine
+    int udp_fd = -1;           // new socket for the rotated destination
+    int old_dst_port = 0;      // old destination port for packet classification
+    char new_dst_ip[100] = ""; // new destination for packet classification
+    int new_dst_port = 0;
+
+    void reset() {
+        active = 0;
+        if (udp_fd >= 0) { sock_close(udp_fd); udp_fd = -1; }
+    }
+    } pre;
+
+// Pointer to the active UDP watcher (set once in client_event_loop).
+// Updated on socket swap so the event loop watches the correct fd.
+static struct ev_io *udp_watcher = nullptr;
+static struct ev_loop *main_loop = nullptr;
+
 int client_on_timer(conn_info_t &conn_info)  // for client. called when a timer is ready in epoll
 {
     packet_info_t &send_info = conn_info.raw_info.send_info;
@@ -359,16 +379,16 @@ static u64_t rotate_pick_threshold() {
 static void client_rotate_port(conn_info_t &conn_info, const char *reason) {
     packet_info_t &send_info = conn_info.raw_info.send_info;
     char old_remote[150] = "";
-    snprintf(old_remote, sizeof(old_remote), "%s:%d", remote_addr.get_ip(), remote_addr.get_port());
-    int new_port = remote_addr.get_port();
+    int old_port = remote_addr.get_port();
+    strncpy(old_remote, remote_addr.get_str(), sizeof(old_remote) - 1);
+
+    // Pick a new remote port (and optionally a new v6 destination)
+    int new_port = old_port;
     if (rotate_port_min > 0 && rotate_port_max > rotate_port_min) {
         int range = rotate_port_max - rotate_port_min + 1;
-        int old_port = new_port;
         while (new_port == old_port)
             new_port = rotate_port_min + (int)(get_true_random_number() % (u64_t)range);
     }
-    // destination-address rotation (v6 pool): every hop lands on a different
-    // remote address, so flows differ on all 5 tuple fields
     if (rotate_dst_list[0] != 0 && remote_addr.get_type() == AF_INET6) {
         char buf[2000];
         snprintf(buf, sizeof(buf), "%s", rotate_dst_list);
@@ -395,19 +415,81 @@ static void client_rotate_port(conn_info_t &conn_info, const char *reason) {
     stall_win_bytes = 0;
 
 #ifdef UDP2RAW_LINUX
-    // the -a rule matches the REMOTE ip — swap it only after remote_addr has
-    // been updated, or the kernel would RST the new connection
     client_rotate_iptables_rule(new_port);
     client_rotate_v6_source();
 #endif
+
+    mylog(log_info, "port rotation (%s): remote %s -> %s:%d after %llu payload bytes, next threshold %llu\n",
+          reason, old_remote, remote_addr.get_ip(), new_port, rotated_bytes, rotate_next_threshold);
+
+    // ——— Make-before-break pre-connection ———
+    // Keep the old connection alive while establishing a new one.
+    // When the new handshake completes in client_on_timer(), the sockets and
+    // raw_info state are atomically swapped — zero tunnel downtime.
+    pre.reset();
+
+    // Classify incoming packets: old port → active conn_info, new port → preconnect
+    pre.old_dst_port = old_port;
+    strncpy(pre.new_dst_ip, remote_addr.get_ip(), sizeof(pre.new_dst_ip) - 1);
+    pre.new_dst_port = new_port;
+
+    // Create and bind a new UDP socket with the rotated source address
+    pre.udp_fd = socket(local_addr.get_type(), SOCK_DGRAM, IPPROTO_UDP);
+    if (pre.udp_fd < 0) goto fallback;
+    setnonblocking(pre.udp_fd);
+    set_buf_size(pre.udp_fd, socket_buf_size);
+
+    {
+        address_t bind_addr;
+        if (remote_addr.get_type() == AF_INET6)
+            bind_addr.from_str("[::]:0");
+        else
+            bind_addr.from_str("0.0.0.0:0");
+        if (force_source_ip && source_addr.get_type() == remote_addr.get_type())
+            bind_addr.from_str_ip_only(source_addr.get_ip());
+        if (::bind(pre.udp_fd, (struct sockaddr *)&bind_addr.inner, bind_addr.get_len()) == -1)
+            goto fallback;
+    }
+
+    // Initialize the preconnect connection state
+    pre.conn.re_init();
+    pre.conn.prepare();
+    pre.conn.my_id = get_true_random_number_nz();
+
+    packet_info_t &p_send = pre.conn.raw_info.send_info;
+    p_send.new_dst_ip.from_address_t(remote_addr);
+    p_send.dst_port = new_port;
+    {
+        address_t tmp_src;
+        get_src_adress2(tmp_src, remote_addr);
+        p_send.new_src_ip.from_address_t(tmp_src);
+        p_send.src_port = client_bind_to_a_new_port2(bind_fd, tmp_src);
+    }
+
+    // Start the handshake on the new socket (udp_fd temporarily swapped so
+    // send_handshake / send_raw0 target the preconnect socket)
+    {
+        int saved_udp_fd = udp_fd;
+        udp_fd = pre.udp_fd;
+        pre.conn.state.client_current_state = client_handshake1;
+        pre.conn.last_state_time = get_current_time();
+        pre.conn.last_hb_sent_time = 0;
+        send_handshake(pre.conn.raw_info, pre.conn.my_id, 0, const_id);
+        udp_fd = saved_udp_fd;
+    }
+
+    pre.active = 1;
+    return;
+
+fallback:
+    pre.reset();
+    // Traditional immediate reconnect
     send_info.new_dst_ip.from_address_t(remote_addr);
     send_info.dst_port = new_port;
     conn_info.state.client_current_state = client_idle;
     conn_info.my_id = get_true_random_number_nz();
-    mylog(log_info, "port rotation (%s): remote %s -> %s:%d after %llu payload bytes, next threshold %llu\n",
-          reason, old_remote, remote_addr.get_ip(), new_port, rotated_bytes, rotate_next_threshold);
-    client_on_timer(conn_info);  // re-bind + transition to client_handshake1
-    client_on_timer(conn_info);  // immediately send handshake1 (saves one timer tick)
+    client_on_timer(conn_info);
+    client_on_timer(conn_info);
 }
 
 static void client_rotate_account(conn_info_t &conn_info, int payload_bytes) {
@@ -488,6 +570,71 @@ int client_on_raw_recv_hs2_or_ready(conn_info_t &conn_info, char type, char *dat
 }
 int client_on_raw_recv(conn_info_t &conn_info)  // called when raw fd received a packet.
 {
+    // Pre-connect classification: if a handshake response for the pending
+    // connection arrived, route it to the preconnect state machine.
+    if (pre.active && conn_info.state.client_current_state == client_ready) {
+        // peek at the raw packet to learn the server's response port
+        char peek_buf[200];
+        address_t::storage_t peek_addr;
+        socklen_t peek_len = sizeof(peek_addr);
+        int peek_len_ret = recvfrom(raw_recv_fd, peek_buf, (int)sizeof(peek_buf), MSG_PEEK,
+                                     (struct sockaddr *)&peek_addr, &peek_len);
+        if (peek_len_ret > 0) {
+            address_t peek;
+            peek.from_sockaddr((sockaddr *)&peek_addr, peek_len);
+            if (peek.get_port() == pre.new_dst_port) {
+                // This packet is for the preconnect — process it with pre.conn
+                conn_info_t &pc = pre.conn;
+                packet_info_t &pc_send = pc.raw_info.send_info;
+                packet_info_t &pc_recv = pc.raw_info.recv_info;
+                char *data;
+                int data_len;
+                if (recv_raw0(pc.raw_info, data, data_len) < 0) return -1;
+                if (data_len >= max_data_len + 1) return -1;
+                if (pc.state.client_current_state == client_handshake1) {
+                    if (recv_bare(pc.raw_info, data, data_len) != 0) return -1;
+                    if (!pc_recv.new_src_ip.equal(pc_send.new_dst_ip) || pc_recv.src_port != pc_send.dst_port) return -1;
+                    if (data_len < int(3 * sizeof(my_id_t))) return -1;
+                    my_id_t tmp_oppsite_id;
+                    memcpy(&tmp_oppsite_id, &data[0], sizeof(tmp_oppsite_id));
+                    tmp_oppsite_id = ntohl(tmp_oppsite_id);
+                    my_id_t tmp_my_id;
+                    memcpy(&tmp_my_id, &data[sizeof(my_id_t)], sizeof(tmp_my_id));
+                    tmp_my_id = ntohl(tmp_my_id);
+                    if (tmp_my_id != pc.my_id) return -1;
+                    pc.oppsite_id = tmp_oppsite_id;
+                    pc.state.client_current_state = client_handshake2;
+                    pc.last_state_time = get_current_time();
+                    pc.last_hb_sent_time = 0;
+                    // Send handshake2 on the preconnect socket
+                    int saved_udp = udp_fd;
+                    udp_fd = pre.udp_fd;
+                    send_handshake(pc.raw_info, pc.my_id, pc.oppsite_id, const_id);
+                    udp_fd = saved_udp;
+                    return 0;
+                } else if (pc.state.client_current_state == client_handshake2) {
+                    vector<char> type_vec;
+                    vector<string> data_vec;
+                    recv_safer_multi(pc, type_vec, data_vec);
+                    if (!data_vec.empty()) {
+                        pc.state.client_current_state = client_ready;
+                        pc.last_hb_sent_time = 0;
+                        pc.last_hb_recv_time = get_current_time();
+                        pc.last_oppsite_roller_time = pc.last_hb_recv_time;
+                    }
+                    return 0;
+                } else if (pc.state.client_current_state == client_ready) {
+                    // Data arrived for preconnect before swap — just swallow it
+                    // (the swap will happen in the next timer tick)
+                    return 0;
+                }
+                // If we get here, discard the packet (not an expected state)
+                discard_raw_packet();
+                return 0;
+            }
+        }
+    }
+
     char *data;
     int data_len;
     packet_info_t &send_info = conn_info.raw_info.send_info;
@@ -613,6 +760,67 @@ int client_on_raw_recv(conn_info_t &conn_info)  // called when raw fd received a
         mylog(log_fatal, "unknown state,this shouldnt happen.\n");
         myexit(-1);
     }
+
+    // Pre-connect handshake retry (same retransmission logic as the active connection)
+    if (pre.active) {
+        conn_info_t &pc = pre.conn;
+        if (pc.state.client_current_state == client_handshake1) {
+            if (get_current_time() - pc.last_hb_sent_time > client_retry_interval) {
+                int saved_udp = udp_fd;
+                udp_fd = pre.udp_fd;
+                send_handshake(pc.raw_info, pc.my_id, 0, const_id);
+                pc.last_hb_sent_time = get_current_time();
+                pc.last_state_time = get_current_time();
+                udp_fd = saved_udp;
+            }
+        } else if (pc.state.client_current_state == client_handshake2) {
+            if (get_current_time() - pc.last_hb_sent_time > client_retry_interval) {
+                int saved_udp = udp_fd;
+                udp_fd = pre.udp_fd;
+                send_handshake(pc.raw_info, pc.my_id, pc.oppsite_id, const_id);
+                pc.last_hb_sent_time = get_current_time();
+                udp_fd = saved_udp;
+            }
+        }
+    }
+
+    // Pre-connect swap: if the new connection reached client_ready, atomically
+    // switch the active socket and copy the completed handshake state.
+    if (pre.active && pre.conn.state.client_current_state == client_ready) {
+        int old_fd = udp_fd;
+        udp_fd = pre.udp_fd;
+        pre.udp_fd = -1;
+        conn_info.my_id = pre.conn.my_id;
+        conn_info.oppsite_id = pre.conn.oppsite_id;
+        memcpy(&conn_info.raw_info.send_info, &pre.conn.raw_info.send_info, sizeof(packet_info_t));
+        memcpy(&conn_info.raw_info.recv_info, &pre.conn.raw_info.recv_info, sizeof(packet_info_t));
+        conn_info.state.client_current_state = client_ready;
+        conn_info.last_hb_recv_time = get_current_time();
+        conn_info.last_hb_sent_time = 0;
+        conn_info.last_oppsite_roller_time = conn_info.last_hb_recv_time;
+        pre.reset();
+        sock_close(old_fd);
+        // Re-point the event-watcher to the new socket
+        if (udp_watcher != nullptr) {
+            ev_io_stop(main_loop, udp_watcher);
+            ev_io_set(udp_watcher, udp_fd, EV_READ);
+            ev_io_start(main_loop, udp_watcher);
+        }
+        mylog(log_info, "preconnect swap: old fd %d → new fd %d, zero-downtime rotation complete\n", old_fd, udp_fd);
+    }
+
+    // Timeout guard: if preconnect doesn't complete within 5s, fall back
+    if (pre.active && get_current_time() - pre.conn.last_state_time > 5000) {
+        mylog(log_warn, "preconnect handshake timed out, falling back\n");
+        int old_fd = udp_fd;
+        pre.reset();
+        sock_close(old_fd);
+        conn_info.state.client_current_state = client_idle;
+        conn_info.my_id = get_true_random_number_nz();
+        client_on_timer(conn_info);
+        client_on_timer(conn_info);
+    }
+
     return 0;
 }
 int client_on_udp_recv(conn_info_t &conn_info) {
@@ -960,6 +1168,7 @@ int client_event_loop() {
 
     struct ev_loop *loop = ev_default_loop(0);
     assert(loop != NULL);
+    main_loop = loop;
 
     // ev.events = EPOLLIN;
     // ev.data.u64 = udp_fd;
@@ -974,6 +1183,7 @@ int client_event_loop() {
     udp_accept_watcher.data = &conn_info;
     ev_io_init(&udp_accept_watcher, udp_accept_cb, udp_fd, EV_READ);
     ev_io_start(loop, &udp_accept_watcher);
+    udp_watcher = &udp_accept_watcher;  // for preconnect socket swaps
 
     // ev.events = EPOLLIN;
     // ev.data.u64 = raw_recv_fd;
