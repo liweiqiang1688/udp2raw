@@ -32,15 +32,15 @@ struct preconnect_t {
     int active = 0;
     conn_info_t conn;          // second connection state machine
     int udp_fd = -1;           // new socket for the rotated destination
-    int old_dst_port = 0;      // old destination port for packet classification
-    char new_dst_ip[100] = ""; // new destination for packet classification
-    int new_dst_port = 0;
+    int new_dst_port = 0;      // server port for packet classification
 
     void reset() {
         active = 0;
         if (udp_fd >= 0) { sock_close(udp_fd); udp_fd = -1; }
+        // conn_info_t destructor frees blob; re_init resets state without re-alloc
+        conn.re_init();
     }
-    } pre;
+} pre;
 
 // Pointer to the active UDP watcher (set once in client_event_loop).
 // Updated on socket swap so the event loop watches the correct fd.
@@ -428,9 +428,6 @@ static void client_rotate_port(conn_info_t &conn_info, const char *reason) {
     // raw_info state are atomically swapped — zero tunnel downtime.
     pre.reset();
 
-    // Classify incoming packets: old port → active conn_info, new port → preconnect
-    pre.old_dst_port = old_port;
-    strncpy(pre.new_dst_ip, remote_addr.get_ip(), sizeof(pre.new_dst_ip) - 1);
     pre.new_dst_port = new_port;
 
     // Create and bind a new UDP socket with the rotated source address
@@ -580,16 +577,24 @@ int client_on_raw_recv(conn_info_t &conn_info)  // called when raw fd received a
     // Pre-connect classification: if a handshake response for the pending
     // connection arrived, route it to the preconnect state machine.
     if (pre.active && conn_info.state.client_current_state == client_ready) {
-        // peek at the raw packet to learn the server's response port
-        char peek_buf[200];
-        address_t::storage_t peek_addr;
-        socklen_t peek_len = sizeof(peek_addr);
-        int peek_len_ret = recvfrom(raw_recv_fd, peek_buf, (int)sizeof(peek_buf), MSG_PEEK,
-                                     (struct sockaddr *)&peek_addr, &peek_len);
-        if (peek_len_ret > 0) {
-            address_t peek;
-            peek.from_sockaddr((sockaddr *)&peek_addr, peek_len);
-            if ((int)peek.get_port() == pre.new_dst_port) {
+        // Peek at the raw packet to extract the server's UDP source port.
+        // recvfrom(MSG_PEEK) on a PF_PACKET socket returns sockaddr_ll
+        // (no port), so we parse the IP+UDP headers manually.
+        char peek_buf[60];  // enough for IPv4/IPv6 header + UDP header
+        int peek_len = recvfrom(raw_recv_fd, peek_buf, (int)sizeof(peek_buf),
+                                 MSG_PEEK, nullptr, nullptr);
+        if (peek_len >= 40) {  // min = IPv4(20) + UDP(8) or IPv6(40) + UDP(8)
+            int udp_off = 0;
+            int version = (unsigned char)peek_buf[0] >> 4;
+            if (version == 4) {
+                udp_off = ((unsigned char)peek_buf[0] & 0x0F) * 4;
+            } else if (version == 6) {
+                udp_off = 40;
+            }
+            if (udp_off > 0 && peek_len >= udp_off + 4) {
+                int src_port = ((unsigned char)peek_buf[udp_off] << 8)
+                             | (unsigned char)peek_buf[udp_off + 1];
+                if (src_port == pre.new_dst_port) {
                 // This packet is for the preconnect — process it with pre.conn
                 conn_info_t &pc = pre.conn;
                 packet_info_t &pc_send = pc.raw_info.send_info;
@@ -819,9 +824,7 @@ int client_on_raw_recv(conn_info_t &conn_info)  // called when raw fd received a
     // Timeout guard: if preconnect doesn't complete within 5s, fall back
     if (pre.active && get_current_time() - pre.conn.last_state_time > 5000) {
         mylog(log_warn, "preconnect handshake timed out, falling back\n");
-        int old_fd = udp_fd;
-        pre.reset();
-        sock_close(old_fd);
+        pre.reset();  // closes pre.udp_fd, old udp_fd stays open
         conn_info.state.client_current_state = client_idle;
         conn_info.my_id = get_true_random_number_nz();
         client_on_timer(conn_info);
