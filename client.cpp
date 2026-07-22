@@ -582,7 +582,7 @@ int client_on_raw_recv(conn_info_t &conn_info)  // called when raw fd received a
         if (peek_len_ret > 0) {
             address_t peek;
             peek.from_sockaddr((sockaddr *)&peek_addr, peek_len);
-            if (peek.get_port() == pre.new_dst_port) {
+            if ((int)peek.get_port() == pre.new_dst_port) {
                 // This packet is for the preconnect — process it with pre.conn
                 conn_info_t &pc = pre.conn;
                 packet_info_t &pc_send = pc.raw_info.send_info;
