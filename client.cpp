@@ -811,7 +811,16 @@ int client_on_raw_recv(conn_info_t &conn_info)  // called when raw fd received a
         conn_info.last_hb_recv_time = get_current_time();
         conn_info.last_hb_sent_time = 0;
         conn_info.last_oppsite_roller_time = conn_info.last_hb_recv_time;
+        // Swap blob (conv_manager) — the preconnect established new conv entries
+        // with the new server address; old entries must not survive the swap.
+        blob_t *old_blob = conn_info.blob;
+        conn_info.blob = pre.conn.blob;
+        pre.conn.blob = nullptr;
+        delete old_blob;
         pre.reset();
+        // Drain the old socket's receive buffer before closing — in-flight
+        // packets that arrived during the swap window would be lost otherwise.
+        { char d[4096]; while (recvfrom(old_fd, d, sizeof(d), MSG_DONTWAIT, nullptr, nullptr) > 0) {} }
         sock_close(old_fd);
         // Re-point the event-watcher to the new socket
         if (udp_watcher != nullptr) {
