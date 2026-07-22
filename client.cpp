@@ -513,10 +513,12 @@ static void client_rotate_port(conn_info_t &conn_info, const char *reason) {
 
     mylog(log_info, "port rotation (%s): remote %s -> %s:%d after %llu payload bytes, next threshold %llu\n",
           reason, old_remote, remote_addr.get_ip(), new_port, rotated_bytes, rotate_next_threshold);
+    char src_ip[100], dst_ip[100];
+    snprintf(src_ip, sizeof(src_ip), "%s", force_source_ip ? source_addr.get_ip() : local_addr.get_ip());
+    snprintf(dst_ip, sizeof(dst_ip), "%s", remote_addr.get_ip());
     mylog(log_info, "  rotation 5-tuple: src=%s:%d  dst=%s:%d\n",
-          force_source_ip ? source_addr.get_ip() : local_addr.get_ip(),
-          conn_info.raw_info.send_info.src_port,
-          remote_addr.get_ip(), new_port);
+          src_ip, conn_info.raw_info.send_info.src_port,
+          dst_ip, remote_addr.get_port());
 
     // Predictive preconnect: if a preconnect is already client_ready
     // (started after the last swap), swap instantly — zero handshake gap.
