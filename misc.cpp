@@ -1420,6 +1420,7 @@ int client_rotate_iptables_rule(int new_port) {
 // IID first group is the marker 0xcec1 — stale addresses can be swept with
 // "ip -6 addr ... | grep cec1:".
 static char v6_cur_addr[100] = "";
+static char v6_pending_del[100] = "";  // deferred deletion after swap
 static struct in6_addr v6_prefix_bin;
 static int v6_prefix_parsed = 0;
 
@@ -1461,15 +1462,27 @@ int client_rotate_v6_source() {
         mylog(log_warn, "rotate-v6: addr add failed (%s) — keeping old source\n", cmd);
         return -1;
     }
+    // Defer deletion of the old address — both old and new addresses
+    // coexist on the interface so the predictive preconnect (bound to
+    // the old address) and the active connection both work simultaneously.
     if (v6_cur_addr[0] != 0) {
-        snprintf(cmd, sizeof(cmd), "ip -6 addr del %s/128 dev %s", v6_cur_addr, rotate_v6_dev);
-        run_command(string(cmd), output, show_none);
+        snprintf(v6_pending_del, sizeof(v6_pending_del), "%s", v6_cur_addr);
     }
     snprintf(v6_cur_addr, sizeof(v6_cur_addr), "%s", new_addr);
     source_addr.from_str_ip_only(v6_cur_addr);
     force_source_ip = 1;
     mylog(log_info, "rotate-v6: source address is now %s dev %s\n", v6_cur_addr, rotate_v6_dev);
     return 0;
+}
+
+void deferred_v6_cleanup() {
+    if (v6_pending_del[0] == 0) return;
+    char cmd[200];
+    char *output;
+    snprintf(cmd, sizeof(cmd), "ip -6 addr del %s/128 dev %s", v6_pending_del, rotate_v6_dev);
+    run_command(string(cmd), output, show_none);
+    mylog(log_info, "rotate-v6: deleted old source address %s dev %s\n", v6_pending_del, rotate_v6_dev);
+    v6_pending_del[0] = 0;
 }
 
 int clear_iptables_rule() {

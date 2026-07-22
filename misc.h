@@ -141,6 +141,7 @@ extern char rotate_dst_list[2000];  // --rotate-dst <addr1,addr2,...>: destinati
 
 int client_rotate_iptables_rule(int new_port);  // move the -a INPUT-drop rule to the new remote port
 int client_rotate_v6_source();                  // swap the source address to a fresh /128 in the prefix
+void deferred_v6_cleanup();                      // delete the deferred v6 address (after swap)
 
 // multi-listen (server side): -l is the primary listen spec, --l2 adds more
 // (e.g. -l 0.0.0.0:6000-6030 --l2 [::]:6100-6107). One process then serves
