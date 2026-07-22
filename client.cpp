@@ -355,6 +355,45 @@ int client_on_timer(conn_info_t &conn_info)  // for client. called when a timer 
         mylog(log_fatal, "unknown state,this shouldnt happen.\n");
         myexit(-1);
     }
+
+    // Preconnect handshake retry — also driven by the periodic timer so
+    // handshakes progress even when raw socket traffic is quiet.
+    if (pre.active) {
+        conn_info_t &pc = pre.conn;
+        if (pc.state.client_current_state == client_handshake1) {
+            if (get_current_time() - pc.last_hb_sent_time > client_retry_interval) {
+                int saved_udp = udp_fd;
+                udp_fd = pre.udp_fd;
+                send_handshake(pc.raw_info, pc.my_id, 0, const_id);
+                pc.last_hb_sent_time = get_current_time();
+                pc.last_state_time = get_current_time();
+                udp_fd = saved_udp;
+            }
+        } else if (pc.state.client_current_state == client_handshake2) {
+            if (get_current_time() - pc.last_hb_sent_time > client_retry_interval) {
+                int saved_udp = udp_fd;
+                udp_fd = pre.udp_fd;
+                send_handshake(pc.raw_info, pc.my_id, pc.oppsite_id, const_id);
+                pc.last_hb_sent_time = get_current_time();
+                udp_fd = saved_udp;
+            }
+        }
+    }
+
+    // Preconnect heartbeat keepalive (when idle, awaiting next rotation)
+    if (pre.active && pre.conn.state.client_current_state == client_ready) {
+        if (get_current_time() - pre.conn.last_hb_sent_time >= heartbeat_interval) {
+            int saved_udp = udp_fd;
+            udp_fd = pre.udp_fd;
+            if (hb_mode == 0)
+                send_safer(pre.conn, 'h', hb_buf, 0);
+            else
+                send_safer(pre.conn, 'h', hb_buf, hb_len);
+            pre.conn.last_hb_sent_time = get_current_time();
+            udp_fd = saved_udp;
+        }
+    }
+
     return 0;
 }
 
@@ -689,8 +728,12 @@ int client_on_raw_recv(conn_info_t &conn_info)  // called when raw fd received a
                     }
                     return 0;
                 } else if (pc.state.client_current_state == client_ready) {
-                    // Data arrived for preconnect before swap — just swallow it
-                    // (the swap will happen in the next timer tick)
+                    // Preconnect is idle — process heartbeats to keep alive
+                    vector<char> type_vec;
+                    vector<string> data_vec;
+                    recv_safer_multi(pc, type_vec, data_vec);
+                    for (int i = 0; i < (int)type_vec.size(); i++)
+                        if (type_vec[i] == 'h') pc.last_hb_recv_time = get_current_time();
                     return 0;
                 }
                 // If we get here, discard the packet (not an expected state)
@@ -904,47 +947,6 @@ int client_on_raw_recv(conn_info_t &conn_info)  // called when raw fd received a
         conn_info.my_id = get_true_random_number_nz();
         client_on_timer(conn_info);
         client_on_timer(conn_info);
-    }
-
-    // If preconnect just reached client_ready during raw_recv, swap immediately
-    // rather than waiting for the next timer tick (timer_interval = 400ms).
-    if (pre.active && pre.conn.state.client_current_state == client_ready) {
-        int old_fd = udp_fd;
-        udp_fd = pre.udp_fd;
-        pre.udp_fd = -1;
-        conn_info.my_id = pre.conn.my_id;
-        conn_info.oppsite_id = pre.conn.oppsite_id;
-        memcpy(&conn_info.raw_info.send_info, &pre.conn.raw_info.send_info, sizeof(packet_info_t));
-        memcpy(&conn_info.raw_info.recv_info, &pre.conn.raw_info.recv_info, sizeof(packet_info_t));
-        conn_info.state.client_current_state = client_ready;
-        conn_info.last_hb_recv_time = get_current_time();
-        conn_info.last_hb_sent_time = 0;
-        conn_info.last_oppsite_roller_time = conn_info.last_hb_recv_time;
-        blob_t *old_blob = conn_info.blob;
-        conn_info.blob = pre.conn.blob;
-        pre.conn.blob = nullptr;
-        delete old_blob;
-        pre.reset();
-        { char d[4096]; while (recvfrom(old_fd, d, sizeof(d), MSG_DONTWAIT, nullptr, nullptr) > 0) {} }
-        sock_close(old_fd);
-#ifdef UDP2RAW_LINUX
-        deferred_v6_cleanup();
-#endif
-        if (udp_watcher != nullptr) {
-            ev_io_stop(main_loop, udp_watcher);
-            ev_io_set(udp_watcher, udp_fd, EV_READ);
-            ev_io_start(main_loop, udp_watcher);
-        }
-        mylog(log_info, "preconnect swap (raw_recv): old fd %d → new fd %d\n", old_fd, udp_fd);
-        {
-            int next = remote_addr.get_port();
-            if (rotate_port_min > 0 && rotate_port_max > rotate_port_min) {
-                int range = rotate_port_max - rotate_port_min + 1;
-                while (next == remote_addr.get_port())
-                    next = rotate_port_min + (int)(get_true_random_number() % (u64_t)range);
-            }
-            start_preconnect(next);
-        }
     }
 
     return 0;
