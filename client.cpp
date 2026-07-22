@@ -644,6 +644,7 @@ int client_on_raw_recv(conn_info_t &conn_info)  // called when raw fd received a
                 discard_raw_packet();
                 return 0;
             }
+            }
         }
     }
 
