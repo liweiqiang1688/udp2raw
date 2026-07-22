@@ -572,6 +572,30 @@ int client_on_raw_recv_hs2_or_ready(conn_info_t &conn_info, char type, char *dat
     }
     return 0;
 }
+
+// Shared handshake1 response parser (used by both active connection and preconnect).
+// Assumes data has already been read via recv_raw0(). Returns 0 on success.
+static int process_handshake1_response(conn_info_t &c, char *data, int data_len) {
+    packet_info_t &s = c.raw_info.send_info;
+    packet_info_t &r = c.raw_info.recv_info;
+    if (recv_bare(c.raw_info, data, data_len) != 0) return -1;
+    if (!r.new_src_ip.equal(s.new_dst_ip) || r.src_port != s.dst_port) return -1;
+    if (data_len < int(3 * sizeof(my_id_t))) return -1;
+
+    my_id_t oppsite_id, my_id;
+    memcpy(&oppsite_id, &data[0], sizeof(oppsite_id));
+    oppsite_id = ntohl(oppsite_id);
+    memcpy(&my_id, &data[sizeof(my_id_t)], sizeof(my_id));
+    my_id = ntohl(my_id);
+    if (my_id != c.my_id) return -1;
+
+    c.oppsite_id = oppsite_id;
+    c.state.client_current_state = client_handshake2;
+    c.last_state_time = get_current_time();
+    c.last_hb_sent_time = 0;
+    return 0;
+}
+
 int client_on_raw_recv(conn_info_t &conn_info)  // called when raw fd received a packet.
 {
     // Pre-connect classification: if a handshake response for the pending
@@ -615,27 +639,12 @@ int client_on_raw_recv(conn_info_t &conn_info)  // called when raw fd received a
                 if (src_port == pre.new_dst_port) {
                 // This packet is for the preconnect — process it with pre.conn
                 conn_info_t &pc = pre.conn;
-                packet_info_t &pc_send = pc.raw_info.send_info;
-                packet_info_t &pc_recv = pc.raw_info.recv_info;
                 char *data;
                 int data_len;
                 if (recv_raw0(pc.raw_info, data, data_len) < 0) return -1;
                 if (data_len >= max_data_len + 1) return -1;
                 if (pc.state.client_current_state == client_handshake1) {
-                    if (recv_bare(pc.raw_info, data, data_len) != 0) return -1;
-                    if (!pc_recv.new_src_ip.equal(pc_send.new_dst_ip) || pc_recv.src_port != pc_send.dst_port) return -1;
-                    if (data_len < int(3 * sizeof(my_id_t))) return -1;
-                    my_id_t tmp_oppsite_id;
-                    memcpy(&tmp_oppsite_id, &data[0], sizeof(tmp_oppsite_id));
-                    tmp_oppsite_id = ntohl(tmp_oppsite_id);
-                    my_id_t tmp_my_id;
-                    memcpy(&tmp_my_id, &data[sizeof(my_id_t)], sizeof(tmp_my_id));
-                    tmp_my_id = ntohl(tmp_my_id);
-                    if (tmp_my_id != pc.my_id) return -1;
-                    pc.oppsite_id = tmp_oppsite_id;
-                    pc.state.client_current_state = client_handshake2;
-                    pc.last_state_time = get_current_time();
-                    pc.last_hb_sent_time = 0;
+                    if (process_handshake1_response(pc, data, data_len) < 0) return -1;
                     // Send handshake2 on the preconnect socket
                     int saved_udp = udp_fd;
                     udp_fd = pre.udp_fd;
