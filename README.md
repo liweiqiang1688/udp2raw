@@ -239,7 +239,7 @@ When an ISP throttles or resets a single flow after sustained volume, rotating t
 | `--rotate-bytes` | 0 (off) | Rotate after N payload bytes, e.g. `10485760` (10 MB) |
 | `--rotate-jitter` | 40 | ±percentage on `--rotate-bytes`, creating a spread so rotations are not periodic |
 | `--rotate-min-interval` | 20 | Minimum seconds between two rotations (prevents thrashing) |
-| `--rotate-max-interval` | 0 (off) | Force a rotation every N seconds regardless of byte count; useful when the ISP kill is time-based |
+| `--rotate-max-interval` | 0 (off) | Rotate once payload is observed after N seconds, even below the byte threshold. This is payload-triggered, not an idle wall-clock timer |
 | `--rotate-ports` | — | Remote port range, e.g. `6100:6131`. The client picks a new port from the range on every rotation |
 | `--rotate-stall` | 8 | Also rotate when uplink stays below 64 KB for N seconds while the connection is ready. 0 = disabled. Escapes clamp-to-zero fuses that produce no bytes and never trigger `--rotate-bytes` |
 
@@ -247,7 +247,7 @@ When an ISP throttles or resets a single flow after sustained volume, rotating t
 
 > Requires a delegated /64 prefix on the client WAN interface.
 
-`--rotate-v6-prefix <addr/64>` and `--rotate-v6-dev <wan-ifname>` instruct the client to `ip -6 addr add` a fresh random /128 address from the prefix on every rotation, *before* opening the new connection. The old address is **deferred** for deletion until the handshake completes and the old socket is closed — both old and new addresses coexist on the interface, so the predictive preconnect socket stays valid across rotations.
+`--rotate-v6-prefix <addr/64>` and `--rotate-v6-dev <wan-ifname>` instruct the client to `ip -6 addr add` a fresh random /128 address from the prefix on every rotation, *before* opening the new connection. The old address is **deferred** for deletion until the handshake completes and the active raw state is swapped — both old and new addresses coexist on the interface while the shared raw socket carries both flows.
 
 `deferred_v6_cleanup()` is called after every swap to delete the old address.
 
@@ -266,7 +266,7 @@ udp2raw -s -l 0.0.0.0:6000-6030 --l2 [::]:6100-6131 -r 127.0.0.1:7000 -k <key> -
 
 ## Make-Before-Break Preconnect
 
-On the client, every rotation starts a background preconnect to the **next** destination port while the old connection keeps carrying data. When the next rotation fires, the preconnect is already in `client_ready` state — the swap is a zero-downtime socket-fd exchange + memcpy of the completed handshake state. If the preconnect isn't ready yet (first rotation or rapid reconnects), the old connection covers the handshake overlap (~400 ms).
+On the client, every rotation starts a background preconnect to the **next** destination port while the old connection keeps carrying data. When the next rotation fires, the preconnect is already in `client_ready` state — the swap copies the completed raw handshake state without replacing tinyvpn's local UDP listener. The shared raw receive filter accepts both source ports during the overlap. If the preconnect isn't ready yet (first rotation or rapid reconnects), the old connection covers the handshake overlap (~400 ms).
 
 The preconnect is kept alive with periodic heartbeats via the existing `client_on_timer` path.
 

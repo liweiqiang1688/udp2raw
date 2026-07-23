@@ -299,7 +299,7 @@ void server_clear_function(u64_t u64);
 
 int send_bare(raw_info_t &raw_info, const char *data, int len);  // send function with encryption but no anti replay,this is used when client and server verifys each other
 // you have to design the protocol carefully, so that you wont be affect by relay attack
-// int reserved_parse_bare(const char *input,int input_len,char* & data,int & len); // a sub function used in recv_bare
+int reserved_parse_bare(const char *input, int input_len, char *&data, int &len); // parse an already-received bare packet
 int recv_bare(raw_info_t &raw_info, char *&data, int &len);  // recv function with encryption but no anti replay,this is used when client and server verifys each other
 // you have to design the protocol carefully, so that you wont be affect by relay attack
 int send_handshake(raw_info_t &raw_info, my_id_t id1, my_id_t id2, my_id_t id3);         // a warp for send_bare for sending handshake(this is not tcp handshake) easily

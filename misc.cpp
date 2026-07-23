@@ -1463,8 +1463,8 @@ int client_rotate_v6_source() {
         return -1;
     }
     // Defer deletion of the old address — both old and new addresses
-    // coexist on the interface so the predictive preconnect (bound to
-    // the old address) and the active connection both work simultaneously.
+    // coexist while the shared raw socket carries the active and predictive
+    // flows simultaneously.
     if (v6_cur_addr[0] != 0) {
         snprintf(v6_pending_del, sizeof(v6_pending_del), "%s", v6_cur_addr);
     }
@@ -1482,6 +1482,24 @@ void deferred_v6_cleanup() {
     snprintf(cmd, sizeof(cmd), "ip -6 addr del %s/128 dev %s", v6_pending_del, rotate_v6_dev);
     run_command(string(cmd), output, show_none);
     mylog(log_info, "rotate-v6: deleted old source address %s dev %s\n", v6_pending_del, rotate_v6_dev);
+    v6_pending_del[0] = 0;
+}
+
+void client_discard_v6_preconnect(const my_ip_t &active_source) {
+    if (rotate_v6_prefix[0] == 0 || rotate_v6_dev[0] == 0 || raw_ip_version != AF_INET6)
+        return;
+
+    char active_addr[100];
+    snprintf(active_addr, sizeof(active_addr), "%s", active_source.get_str2());
+    if (v6_cur_addr[0] != 0 && strcmp(v6_cur_addr, active_addr) != 0) {
+        char cmd[200];
+        char *output;
+        snprintf(cmd, sizeof(cmd), "ip -6 addr del %s/128 dev %s", v6_cur_addr, rotate_v6_dev);
+        run_command(string(cmd), output, show_none);
+        mylog(log_info, "rotate-v6: discarded failed preconnect address %s dev %s\n", v6_cur_addr, rotate_v6_dev);
+    }
+    snprintf(v6_cur_addr, sizeof(v6_cur_addr), "%s", active_addr);
+    source_addr.from_str_ip_only(v6_cur_addr);
     v6_pending_del[0] = 0;
 }
 

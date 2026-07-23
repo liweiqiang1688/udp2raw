@@ -126,7 +126,7 @@ extern char fifo_file[1000];
 extern u64_t rotate_bytes;       // --rotate-bytes: payload bytes per flow, 0=disabled
 extern int rotate_jitter;        // --rotate-jitter: ±percent jitter on the threshold
 extern int rotate_min_interval;  // --rotate-min-interval: min seconds between rotations
-extern int rotate_max_interval;  // --rotate-max-interval: force rotation every N seconds (0=off)
+extern int rotate_max_interval;  // --rotate-max-interval: payload-triggered age (0=off)
 extern int rotate_port_min;      // --rotate-ports start:end; 0:0 = stay on the -r port
 extern int rotate_port_max;
 // IPv6 source rotation: on every rotation, pick a fresh random interface-ID
@@ -142,6 +142,7 @@ extern char rotate_dst_list[2000];  // --rotate-dst <addr1,addr2,...>: destinati
 int client_rotate_iptables_rule(int new_port);  // move the -a INPUT-drop rule to the new remote port
 int client_rotate_v6_source();                  // swap the source address to a fresh /128 in the prefix
 void deferred_v6_cleanup();                      // delete the deferred v6 address (after swap)
+void client_discard_v6_preconnect(const my_ip_t &active_source); // remove a failed pending /128
 
 // multi-listen (server side): -l is the primary listen spec, --l2 adds more
 // (e.g. -l 0.0.0.0:6000-6030 --l2 [::]:6100-6107). One process then serves
