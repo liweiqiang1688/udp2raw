@@ -1417,8 +1417,8 @@ int client_rotate_iptables_rule(int new_port) {
 //————— IPv6 source rotation (client only) —————
 // Every rotation gets a fresh random interface-ID inside the delegated /64,
 // added as /128 on the wan interface so the ONU's NDP delivers return traffic.
-// IID first group is the marker 0xcec1 — stale addresses can be swept with
-// "ip -6 addr ... | grep cec1:".
+// IID is fully random — stale addresses tagged with nodad can be swept with
+// "ip -6 addr ... | grep /128.*nodad".
 static char v6_cur_addr[100] = "";
 static char v6_pending_del[100] = "";  // deferred deletion after swap
 static struct in6_addr v6_prefix_bin;
