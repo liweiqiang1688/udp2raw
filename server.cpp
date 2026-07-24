@@ -274,14 +274,14 @@ int server_on_raw_recv_pre_ready(conn_info_t &conn_info, char *ip_port, u32_t tm
                 return 0;
             }
             address_t addr1;
-            addr1.from_ip_port_new(raw_ip_version, &ori_conn_info.raw_info.recv_info.new_src_ip, ori_conn_info.raw_info.recv_info.src_port);
+            addr1.from_ip_port_new(ori_conn_info.raw_family, &ori_conn_info.raw_info.recv_info.new_src_ip, ori_conn_info.raw_info.recv_info.src_port);
             if (!conn_manager.exist(addr1))  // TODO remove this
             {
                 mylog(log_fatal, "[%s]this shouldnt happen\n", ip_port);
                 myexit(-1);
             }
             address_t addr2;
-            addr2.from_ip_port_new(raw_ip_version, &conn_info.raw_info.recv_info.new_src_ip, conn_info.raw_info.recv_info.src_port);
+            addr2.from_ip_port_new(conn_info.raw_family, &conn_info.raw_info.recv_info.new_src_ip, conn_info.raw_info.recv_info.src_port);
             if (!conn_manager.exist(addr2))  // TODO remove this
             {
                 mylog(log_fatal, "[%s]this shouldnt happen2\n", ip_port);
@@ -496,6 +496,12 @@ int server_on_raw_recv_multi()  // called when server received an raw packet
         mylog(log_info, "[%s]got packet from a new ip\n", ip_port);
 
         conn_info_t &conn_info = conn_manager.find_insert(addr);
+        // Stamp the family this conn was created on (the firing listen
+        // socket's). The recovery path must NOT use the raw_ip_version
+        // global for map lookups — with mixed v4/v6 listeners that global
+        // tracks the last packet, and a wrong-family key misses the map and
+        // trips the "this shouldnt happen" myexit crash.
+        conn_info.raw_family = raw_ip_version;
         conn_info.raw_info = tmp_raw_info;
         raw_info_t &raw_info = conn_info.raw_info;
 
@@ -530,6 +536,8 @@ int server_on_raw_recv_multi()  // called when server received an raw packet
     }
 
     conn_info_t &conn_info = conn_manager.find_insert(addr);  // insert if not exist
+    if (conn_info.raw_family != AF_INET && conn_info.raw_family != AF_INET6)
+        conn_info.raw_family = raw_ip_version;  // stamp once at creation; see note above about the recovery crash
     packet_info_t &send_info = conn_info.raw_info.send_info;
     packet_info_t &recv_info = conn_info.raw_info.recv_info;
     raw_info_t &raw_info = conn_info.raw_info;
