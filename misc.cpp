@@ -232,10 +232,14 @@ void print_help() {
     printf("    --rotate-dst          <a1,a2,...>     comma-separated destination address pool (v6): every\n");
     printf("                                          rotation also jumps to a different remote address from\n");
     printf("                                          this list, so flows differ on all 5 tuple fields\n");
-    printf("    --rotate-endpoints    <spec,...>      mixed IPv4/IPv6 endpoint pool. Each spec includes its\n");
-    printf("                                          own port or range, e.g. 1.2.3.4:6000-6030,\n");
-    printf("                                          [2001:db8::1]:6100-6131. Cross-family switches use\n");
-    printf("                                          heartbeat-qualified make-before-break preconnects\n");
+    printf("    --rotate-v4-endpoints <spec,...>      IPv4 endpoint group, e.g. 1.2.3.4:6000-6030 (preferred\n");
+    printf("                                          spelling; one fresh endpoint is picked from this group\n");
+    printf("                                          whenever the flow lands on IPv4)\n");
+    printf("    --rotate-v6-endpoints <spec,...>      IPv6 endpoint group, e.g. [2001:db8::1]:6100-6131\n");
+    printf("                                          (picked whenever the flow lands on IPv6)\n");
+    printf("    --rotate-endpoints    <spec,...>      legacy mixed v4+v6 pool in one list — every hop swaps\n");
+    printf("                                          family via a heartbeat-qualified preconnect; use the\n");
+    printf("                                          split options above for new configs\n");
     printf("    --l2                  <addr>:<p[-m]>  extra listen spec (server only, repeatable up to 4):\n");
     printf("                                          one process then serves all specs, e.g.\n");
     printf("                                          -l 0.0.0.0:6000-6030 --l2 [::]:6100-6107\n");
@@ -329,6 +333,38 @@ int process_log_level(int argc, char *argv[])  // process  --log-level and --dis
     }
     return 0;
 }
+// Parse a comma-separated endpoint list ("addr:port[-range],...") into
+// rotate_endpoint_specs. When expect_family is set, every spec must match it
+// — the v4/v6 groups are kept explicit by option name, and a mismatch is a
+// config error worth dying loudly over.
+static void parse_endpoint_list(const char *list, int expect_family, const char *optname) {
+    char buf[8192];
+    snprintf(buf, sizeof(buf), "%s", list);
+    int group_count = 0;
+    char *save = nullptr;
+    for (char *item = strtok_r(buf, ",", &save);
+         item != nullptr;
+         item = strtok_r(nullptr, ",", &save)) {
+        if (rotate_endpoint_spec_cnt >= MAX_ROTATE_ENDPOINT_SPECS) {
+            mylog(log_fatal, "too many rotate endpoint specs (max %d)\n",
+                  MAX_ROTATE_ENDPOINT_SPECS);
+            myexit(-1);
+        }
+        listen_spec_t &spec = rotate_endpoint_specs[rotate_endpoint_spec_cnt];
+        if (parse_listen_spec(item, spec) != 0) {
+            mylog(log_fatal, "%s: invalid endpoint spec [%s]\n", optname, item);
+            myexit(-1);
+        }
+        if (expect_family != 0 && (int)spec.addr.get_type() != expect_family) {
+            mylog(log_fatal, "%s: address [%s] is not in the expected family\n", optname, item);
+            myexit(-1);
+        }
+        rotate_endpoint_spec_cnt++;
+        group_count++;
+    }
+    mylog(log_info, "%s: %d endpoint spec(s)\n", optname, group_count);
+}
+
 void process_arg(int argc, char *argv[])  // process all options
 {
     int i, j, k, opt;
@@ -391,6 +427,8 @@ void process_arg(int argc, char *argv[])  // process all options
             {"rotate-stall", required_argument, 0, 1},
             {"rotate-dst", required_argument, 0, 1},
             {"rotate-endpoints", required_argument, 0, 1},
+            {"rotate-v4-endpoints", required_argument, 0, 1},
+            {"rotate-v6-endpoints", required_argument, 0, 1},
             {"l2", required_argument, 0, 1},
             {NULL, 0, 0, 0}};
 
@@ -804,26 +842,18 @@ void process_arg(int argc, char *argv[])  // process all options
                     sscanf(optarg, "%1999s", rotate_dst_list);
                     mylog(log_info, "rotate_dst_list=%s \n", rotate_dst_list);
                 } else if (strcmp(long_options[option_index].name, "rotate-endpoints") == 0) {
-                    char endpoint_buf[8192];
-                    snprintf(endpoint_buf, sizeof(endpoint_buf), "%s", optarg);
-                    char *save = nullptr;
-                    for (char *item = strtok_r(endpoint_buf, ",", &save);
-                         item != nullptr;
-                         item = strtok_r(nullptr, ",", &save)) {
-                        if (rotate_endpoint_spec_cnt >= MAX_ROTATE_ENDPOINT_SPECS) {
-                            mylog(log_fatal, "too many rotate endpoint specs (max %d)\n",
-                                  MAX_ROTATE_ENDPOINT_SPECS);
-                            myexit(-1);
-                        }
-                        if (parse_listen_spec(item, rotate_endpoint_specs[rotate_endpoint_spec_cnt]) != 0)
-                            myexit(-1);
-                        rotate_endpoint_spec_cnt++;
-                    }
+                    // legacy mixed form — both families in one list; the split
+                    // --rotate-v4-endpoints / --rotate-v6-endpoints options
+                    // are the preferred spelling for new configs
+                    parse_endpoint_list(optarg, 0, "--rotate-endpoints");
                     if (rotate_endpoint_spec_cnt == 0) {
                         mylog(log_fatal, "--rotate-endpoints requires at least one endpoint\n");
                         myexit(-1);
                     }
-                    mylog(log_info, "rotate_endpoint_specs=%d\n", rotate_endpoint_spec_cnt);
+                } else if (strcmp(long_options[option_index].name, "rotate-v4-endpoints") == 0) {
+                    parse_endpoint_list(optarg, AF_INET, "--rotate-v4-endpoints");
+                } else if (strcmp(long_options[option_index].name, "rotate-v6-endpoints") == 0) {
+                    parse_endpoint_list(optarg, AF_INET6, "--rotate-v6-endpoints");
                 } else if (strcmp(long_options[option_index].name, "l2") == 0) {
                     no_l = 0;
                     if (listen_spec_cnt >= MAX_LISTEN_SPECS) {
