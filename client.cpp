@@ -184,6 +184,18 @@ struct preconnect_t {
     }
 } pre;
 
+//————— postconnect drain (make-before-break's other half) —————
+// After a swap, ~1 RTT of downlink is still in flight on the OLD tuple. The
+// previous design narrowed the BPF to the new port and the state machine's
+// address check dropped those packets — a guaranteed loss burst per swap,
+// retransmitted by inner TCP at RTO cost. Keep the old flow's conn alive for
+// a short drain window instead.
+struct drain_t {
+    int active = 0;
+    conn_info_t conn;  // shallow field copies; blob is MOVED in (not copied)
+    u64_t expire_time = 0;
+} drain;
+
 static void fail_preconnect(conn_info_t &active_conn, const char *reason) {
     mylog(log_warn, "%s; keeping active flow\n", reason);
     int failed_family = pre.conn.raw_family;
@@ -300,6 +312,20 @@ int client_on_timer(conn_info_t &conn_info)  // for client. called when a timer 
         conn_info.raw_family = remote_addr.get_type();
     packet_info_t &send_info = conn_info.raw_info.send_info;
     packet_info_t &recv_info = conn_info.raw_info.recv_info;
+
+    // Expire the postconnect drain window: the old flow is torn down and the
+    // BPF narrows back to just the new port.
+    if (drain.active && get_current_time() > drain.expire_time) {
+        mylog(log_info, "postconnect drain expired — old flow torn down\n");
+        drain.active = 0;
+        delete drain.conn.blob;
+        drain.conn.blob = nullptr;
+        drain.conn.re_init();
+#ifdef UDP2RAW_LINUX
+        if (!disable_bpf_filter)
+            init_filter(conn_info.raw_info.send_info.src_port);
+#endif
+    }
 
     // Progress the predictive connection independently of the active flow.
     // This must run before the active-state branches below, which return after
@@ -830,6 +856,18 @@ static void swap_preconnect(conn_info_t &conn_info) {
         || !pre.heartbeat_confirmed)
         return;
 
+    // Stale-qualification guard: the standby was qualified when created, but
+    // the ISP can kill a fresh endpoint in seconds — and the swap may happen
+    // ~10s later. Require a heartbeat response inside the last 2s or discard
+    // the standby instead of swapping onto a dead flow (previously the cause
+    // of unrecovered multi-second blackouts).
+    long long hb_stale_ms = (long long)(get_current_time() - pre.conn.last_hb_recv_time);
+    if (hb_stale_ms > 2000) {
+        mylog(log_warn, "preconnect standby heartbeat stale by %lld ms — refusing to swap onto a dead flow\n", hb_stale_ms);
+        fail_preconnect(conn_info, "stale standby heartbeat");
+        return;
+    }
+
     const int new_port = pre.conn.raw_info.send_info.dst_port;
     const int new_family = pre.conn.raw_family;
     address_t pre_remote = pre.endpoint;
@@ -864,10 +902,28 @@ static void swap_preconnect(conn_info_t &conn_info) {
     }
 #endif
 
-    blob_t *old_blob = conn_info.blob;
+    // Postconnect drain: move the just-replaced flow's state into the drain
+    // slot instead of deleting it, so in-flight downlink on the old tuple is
+    // still decrypted and delivered (~1 RTT grace) instead of dropped at the
+    // narrowed filter.
+    if (drain.conn.blob != nullptr) {
+        delete drain.conn.blob;  // expire any previous drain (shouldn't linger)
+        drain.conn.blob = nullptr;
+    }
+    drain.conn.raw_info = conn_info.raw_info;
+    drain.conn.my_id = conn_info.my_id;
+    drain.conn.oppsite_id = conn_info.oppsite_id;
+    drain.conn.local_const_id = conn_info.local_const_id;
+    drain.conn.raw_family = conn_info.raw_family;
+    drain.conn.state.client_current_state = client_ready;
+    drain.conn.last_hb_recv_time = get_current_time();
+    drain.conn.last_hb_sent_time = 0;
+    drain.conn.blob = conn_info.blob;  // move — NOT deleted
+    drain.active = 1;
+    drain.expire_time = get_current_time() + 2000;  // ~2s drain window (>= 2 RTT)
+
     conn_info.blob = pre.conn.blob;
     pre.conn.blob = nullptr;
-    delete old_blob;
     pre.reset();
     select_client_family(conn_info.raw_family);
     mark_family_success(conn_info.raw_family);
@@ -875,8 +931,17 @@ static void swap_preconnect(conn_info_t &conn_info) {
 #ifdef UDP2RAW_LINUX
     if (conn_info.raw_family == AF_INET6)
         deferred_v6_cleanup();  // old source address is no longer needed
-    if (!disable_bpf_filter)
-        init_filter(conn_info.raw_info.send_info.src_port);
+    if (!disable_bpf_filter) {
+        if (drain.active && drain.conn.raw_family == conn_info.raw_family) {
+            // same-family drain: keep BOTH ports in the filter until the
+            // drain window expires (expiry narrows it back to the new port)
+            int lo = std::min(drain.conn.raw_info.send_info.src_port, conn_info.raw_info.send_info.src_port);
+            int hi = std::max(drain.conn.raw_info.send_info.src_port, conn_info.raw_info.send_info.src_port);
+            attach_range_filter(raw_recv_fd, conn_info.raw_family, lo, hi);
+        } else {
+            init_filter(conn_info.raw_info.send_info.src_port);
+        }
+    }
     client_rotate_iptables_rule(new_port);
 #endif
     mylog(log_info, "preconnect swap: active raw flow is now %s:%d\n",
@@ -1061,19 +1126,21 @@ static int process_handshake1_response(conn_info_t &c, char *data, int data_len)
 int client_on_raw_recv(conn_info_t &conn_info)  // called when raw fd received a packet.
 {
     // A mixed-family client has one PF_PACKET watcher per family. Ignore a
-    // packet unless that family currently belongs to the active or pending
-    // connection.
+    // packet unless that family currently belongs to the active, pending, or
+    // draining connection.
     if (conn_info.raw_family != (int)raw_ip_version
-        && (!pre.active || pre.conn.raw_family != (int)raw_ip_version)) {
+        && (!pre.active || pre.conn.raw_family != (int)raw_ip_version)
+        && (!drain.active || drain.conn.raw_family != (int)raw_ip_version)) {
 #ifdef UDP2RAW_LINUX
         if (pre_recv_raw_packet() == 0) discard_raw_packet();
 #endif
         return 0;
     }
 
-    // Pre-connect classification: if a handshake response for the pending
-    // connection arrived, route it to the preconnect state machine.
-    if (pre.active && pre.conn.raw_family == (int)raw_ip_version
+    // Pre-connect / drain classification: if a packet for the pending or the
+    // draining connection arrived, route it to the right state machine.
+    if ((pre.active && pre.conn.raw_family == (int)raw_ip_version
+         || drain.active && drain.conn.raw_family == (int)raw_ip_version)
         && conn_info.state.client_current_state == client_ready) {
         // Peek at the raw packet to extract the server's TCP/UDP source port.
         // recvfrom(MSG_PEEK) on a PF_PACKET socket returns sockaddr_ll
@@ -1195,6 +1262,33 @@ int client_on_raw_recv(conn_info_t &conn_info)  // called when raw fd received a
                     // If we get here, discard the packet (not an expected state)
                     discard_raw_packet();
                     return 0;
+                }
+                // Postconnect drain: a packet from the just-replaced flow.
+                // Decrypt + deliver via the drain conn (kept alive for ~2s)
+                // instead of dropping it at the state machine's address check.
+                if (drain.active) {
+                    int drain_ip_match = 0;
+                    my_ip_t &ddip = drain.conn.raw_info.send_info.new_dst_ip;
+                    if (version == 4 && drain.conn.raw_family == AF_INET) {
+                        drain_ip_match = memcmp(peek_buf + 12, &ddip.v4, 4) == 0;
+                    } else if (version == 6 && drain.conn.raw_family == AF_INET6) {
+                        drain_ip_match = memcmp(peek_buf + 8, &ddip.v6, 16) == 0;
+                    }
+                    if (drain_ip_match && src_port == (int)drain.conn.raw_info.send_info.dst_port) {
+                        select_client_family(drain.conn.raw_family);
+#ifdef UDP2RAW_LINUX
+                        if (pre_recv_raw_packet() < 0) return -1;
+#endif
+                        vector<char> type_vec;
+                        vector<string> data_vec;
+                        if (recv_safer_multi(drain.conn, type_vec, data_vec) == 0) {
+                            for (int i = 0; i < (int)type_vec.size(); i++) {
+                                client_on_raw_recv_hs2_or_ready(drain.conn, type_vec[i],
+                                    (char *)data_vec[i].c_str(), (int)data_vec[i].length());
+                            }
+                        }
+                        return 0;
+                    }
                 }
             }
         }
