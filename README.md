@@ -241,7 +241,20 @@ When an ISP throttles or resets a single flow after sustained volume, rotating t
 | `--rotate-min-interval` | 20 | Minimum seconds between two rotations (prevents thrashing) |
 | `--rotate-max-interval` | 0 (off) | Rotate once payload is observed after N seconds, even below the byte threshold. This is payload-triggered, not an idle wall-clock timer |
 | `--rotate-ports` | — | Remote port range, e.g. `6100:6131`. The client picks a new port from the range on every rotation |
+| `--rotate-endpoints` | — | Mixed-family endpoint pool, e.g. `203.0.113.1:6000-6030,[2001:db8::1]:6100-6131`. Opens v4 and v6 sockets concurrently and selects an endpoint per hop |
 | `--rotate-stall` | 8 | Also rotate when uplink stays below 64 KB for N seconds while the connection is ready. 0 = disabled. Escapes clamp-to-zero fuses that produce no bytes and never trigger `--rotate-bytes` |
+
+`--rotate-endpoints` supersedes `--rotate-ports` and `--rotate-dst` for new
+dual-stack deployments. The client keeps one raw socket pair per address
+family and creates a standby connection with its own connection identity.
+The standby must complete its handshake **and** return an authenticated
+heartbeat before it can replace the active path.
+
+If a family fails its handshake or heartbeat qualification, the active
+connection is left untouched and that family enters an exponential cooldown
+(5, 10, 20, 40, then 60 seconds). When neither family is currently usable,
+the active connection continues carrying traffic and endpoint selection is
+retried by later timer/rotation events; the process is not terminated.
 
 ## IPv6 Source Address Rotation (`--rotate-v6-*`)
 
@@ -266,9 +279,17 @@ udp2raw -s -l 0.0.0.0:6000-6030 --l2 [::]:6100-6131 -r 127.0.0.1:7000 -k <key> -
 
 ## Make-Before-Break Preconnect
 
-On the client, every rotation starts a background preconnect to the **next** destination port while the old connection keeps carrying data. When the next rotation fires, the preconnect is already in `client_ready` state — the swap copies the completed raw handshake state without replacing tinyvpn's local UDP listener. The shared raw receive filter accepts both source ports during the overlap. If the preconnect isn't ready yet (first rotation or rapid reconnects), the old connection covers the handshake overlap (~400 ms).
+On the client, every rotation starts a background preconnect to the **next**
+endpoint while the old connection keeps carrying data. When the next rotation
+fires, the preconnect is already heartbeat-qualified — the swap copies the
+completed raw handshake state without replacing tinyvpn's local UDP listener.
+The family-specific raw receive filters accept the active and standby source
+ports during the overlap. If the preconnect is not healthy yet, the old
+connection remains active instead of being broken for the new handshake.
 
-The preconnect is kept alive with periodic heartbeats via the existing `client_on_timer` path.
+The active and standby connections each use authenticated udp2raw heartbeats
+(approximately every 600 ms with the current defaults). A standby
+qualification allows three heartbeat periods (1.8 seconds).
 
 ### Debug Logging
 

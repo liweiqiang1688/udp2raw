@@ -37,6 +37,8 @@ int create_listen_sock(int family, int port_min, int port_max);              // 
 int attach_range_filter(int fd, int family, int port_min, int port_max);      // BPF portrange on an existing fd
 int use_listen_sock_by_index(int idx);                                       // swap globals to spec
 int use_listen_sock_for_port(int port);                                      // swap globals to the spec owning port
+int use_listen_sock_for_family(int family);                                  // swap globals to the first spec of family
+int init_client_family_sockets();                                            // mixed-family client raw socket pairs
 
 extern int lower_level;
 extern int lower_level_manual;

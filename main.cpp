@@ -88,7 +88,14 @@ int main(int argc, char *argv[]) {
     iptables_rule();
 
 #ifdef UDP2RAW_LINUX
-    init_raw_socket();
+    if (program_mode == client_mode && rotate_endpoint_spec_cnt > 0) {
+        if (init_client_family_sockets() != 0) {
+            mylog(log_fatal, "failed to initialize mixed-family client sockets\n");
+            myexit(-1);
+        }
+    } else {
+        init_raw_socket();
+    }
 #endif
 
     if (program_mode == client_mode) {

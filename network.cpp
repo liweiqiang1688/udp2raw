@@ -878,6 +878,31 @@ int use_listen_sock_for_port(int port) {
     }
     return -1;
 }
+
+int use_listen_sock_for_family(int family) {
+    for (int i = 0; i < listen_sock_cnt; i++) {
+        if (listen_socks[i].family == family)
+            return use_listen_sock_by_index(i);
+    }
+    return -1;
+}
+
+// A mixed-family client uses the same family-matched socket pair abstraction
+// as the multi-listen server. Start with a permissive port filter; client.cpp
+// narrows each family to its active/pending source port once allocated.
+int init_client_family_sockets() {
+    listen_sock_cnt = 0;
+    int need_v4 = (remote_addr.get_type() == AF_INET);
+    int need_v6 = (remote_addr.get_type() == AF_INET6);
+    for (int i = 0; i < rotate_endpoint_spec_cnt; i++) {
+        int family = rotate_endpoint_specs[i].addr.get_type();
+        need_v4 |= (family == AF_INET);
+        need_v6 |= (family == AF_INET6);
+    }
+    if (need_v4 && create_listen_sock(AF_INET, 1, 65535) < 0) return -1;
+    if (need_v6 && create_listen_sock(AF_INET6, 1, 65535) < 0) return -1;
+    return use_listen_sock_for_family(remote_addr.get_type());
+}
 #endif
 
 #ifdef UDP2RAW_MP

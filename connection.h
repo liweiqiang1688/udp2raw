@@ -221,6 +221,10 @@ struct conn_info_t  // stores info for a raw connection.for client ,there is onl
     current_state_t state;
 
     raw_info_t raw_info;
+    // Client connections may coexist across IPv4 and IPv6 during a
+    // make-before-break rotation. Server connections continue to derive the
+    // family from the firing listen socket.
+    int raw_family;
     u64_t last_state_time;
     u64_t last_hb_sent_time;  // client re-use this for retry
     u64_t last_hb_recv_time;
@@ -228,6 +232,10 @@ struct conn_info_t  // stores info for a raw connection.for client ,there is onl
 
     my_id_t my_id;
     my_id_t oppsite_id;
+    // Each simultaneously established client path needs its own stable
+    // identity. Reusing one const_id makes the server recover (move) the
+    // active connection instead of keeping a standby path alive.
+    my_id_t local_const_id;
 
     fd64_t timer_fd64;
     fd64_t udp_fd64;

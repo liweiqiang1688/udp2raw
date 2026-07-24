@@ -19,6 +19,14 @@
 int server_on_timer_multi(conn_info_t &conn_info)  // for server. called when a timer is ready in epoll.for server,there will be one timer for every connection
 // there is also a global timer for server,but its not handled here
 {
+#ifdef UDP2RAW_LINUX
+    // Timer events are not associated with a listen fd. Restore the
+    // family/socket belonging to this connection before formatting its
+    // address or sending its heartbeat; otherwise the most recently received
+    // packet can make an IPv6 connection send through the IPv4 raw socket
+    // (or vice versa).
+    use_listen_sock_for_port(conn_info.raw_info.send_info.src_port);
+#endif
     char ip_port[max_addr_len];
     // u32_t ip=conn_info.raw_info.send_info.dst_ip;
     // u32_t port=conn_info.raw_info.send_info.dst_port;

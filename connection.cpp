@@ -63,6 +63,7 @@ int anti_replay_t::is_vaild(u64_t seq) {
 
 void conn_info_t::recover(const conn_info_t &conn_info) {
     raw_info = conn_info.raw_info;
+    raw_family = conn_info.raw_family;
 
     raw_info.rst_received = 0;
     raw_info.disabled = 0;
@@ -72,6 +73,7 @@ void conn_info_t::recover(const conn_info_t &conn_info) {
     last_hb_sent_time = conn_info.last_hb_sent_time;
     my_id = conn_info.my_id;
     oppsite_id = conn_info.oppsite_id;
+    local_const_id = conn_info.local_const_id;
     blob->anti_replay.re_init();
 
     my_roller = 0;       // no need to set,but for easier debug,set it to zero
@@ -86,6 +88,8 @@ void conn_info_t::re_init() {
     else
         state.client_current_state = client_idle;
     last_state_time = 0;
+    raw_family = -1;
+    local_const_id = 0;
     oppsite_const_id = 0;
 
     timer_fd64 = 0;
