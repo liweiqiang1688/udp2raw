@@ -140,9 +140,12 @@ extern int rotate_stall;            // --rotate-stall <sec>: rotate if uplink <6
 extern char rotate_dst_list[2000];  // --rotate-dst <addr1,addr2,...>: destination v6 pool to rotate through
 
 int client_rotate_iptables_rule(int new_port);  // move the -a INPUT-drop rule to the new remote port
+int client_standby_rule_add(const char *ip, int family, int port);  // second drop rule for a preconnect standby
+int client_standby_rule_del();                                        // remove the standby rule
 int client_rotate_v6_source();                  // swap the source address to a fresh /128 in the prefix
 void deferred_v6_cleanup();                      // delete the deferred v6 address (after swap)
-void client_discard_v6_preconnect(const my_ip_t &active_source); // remove a failed pending /128
+void client_discard_v6_preconnect(const my_ip_t &active_source,
+                                  int active_family = AF_INET6); // remove a failed pending /128
 
 // multi-listen (server side): -l is the primary listen spec, --l2 adds more
 // (e.g. -l 0.0.0.0:6000-6030 --l2 [::]:6100-6107). One process then serves
@@ -156,6 +159,15 @@ struct listen_spec_t {
 extern listen_spec_t listen_specs[MAX_LISTEN_SPECS];
 extern int listen_spec_cnt;
 int parse_listen_spec(const char *str, listen_spec_t &spec);
+
+// Mixed-family client endpoint pool. Each entry carries its own address
+// family and port range, e.g.
+//   --rotate-endpoints 173.230.155.222:6000-6030,[2600:...]:6100-6131
+// The client keeps one raw socket context per family and make-before-break
+// preconnects across these entries.
+#define MAX_ROTATE_ENDPOINT_SPECS 64
+extern listen_spec_t rotate_endpoint_specs[MAX_ROTATE_ENDPOINT_SPECS];
+extern int rotate_endpoint_spec_cnt;
 
 extern raw_mode_t raw_mode;
 extern u32_t raw_ip_version;

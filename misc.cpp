@@ -80,6 +80,8 @@ char rotate_dst_list[2000] = "";
 
 listen_spec_t listen_specs[MAX_LISTEN_SPECS];
 int listen_spec_cnt = 0;
+listen_spec_t rotate_endpoint_specs[MAX_ROTATE_ENDPOINT_SPECS];
+int rotate_endpoint_spec_cnt = 0;
 
 // Parse "addr:port", "addr:min-max", "[v6]:port", "[v6]:min-max" into a spec.
 int parse_listen_spec(const char *str, listen_spec_t &spec) {
@@ -230,6 +232,10 @@ void print_help() {
     printf("    --rotate-dst          <a1,a2,...>     comma-separated destination address pool (v6): every\n");
     printf("                                          rotation also jumps to a different remote address from\n");
     printf("                                          this list, so flows differ on all 5 tuple fields\n");
+    printf("    --rotate-endpoints    <spec,...>      mixed IPv4/IPv6 endpoint pool. Each spec includes its\n");
+    printf("                                          own port or range, e.g. 1.2.3.4:6000-6030,\n");
+    printf("                                          [2001:db8::1]:6100-6131. Cross-family switches use\n");
+    printf("                                          heartbeat-qualified make-before-break preconnects\n");
     printf("    --l2                  <addr>:<p[-m]>  extra listen spec (server only, repeatable up to 4):\n");
     printf("                                          one process then serves all specs, e.g.\n");
     printf("                                          -l 0.0.0.0:6000-6030 --l2 [::]:6100-6107\n");
@@ -384,6 +390,7 @@ void process_arg(int argc, char *argv[])  // process all options
             {"rotate-v6-dev", required_argument, 0, 1},
             {"rotate-stall", required_argument, 0, 1},
             {"rotate-dst", required_argument, 0, 1},
+            {"rotate-endpoints", required_argument, 0, 1},
             {"l2", required_argument, 0, 1},
             {NULL, 0, 0, 0}};
 
@@ -796,6 +803,27 @@ void process_arg(int argc, char *argv[])  // process all options
                 } else if (strcmp(long_options[option_index].name, "rotate-dst") == 0) {
                     sscanf(optarg, "%1999s", rotate_dst_list);
                     mylog(log_info, "rotate_dst_list=%s \n", rotate_dst_list);
+                } else if (strcmp(long_options[option_index].name, "rotate-endpoints") == 0) {
+                    char endpoint_buf[8192];
+                    snprintf(endpoint_buf, sizeof(endpoint_buf), "%s", optarg);
+                    char *save = nullptr;
+                    for (char *item = strtok_r(endpoint_buf, ",", &save);
+                         item != nullptr;
+                         item = strtok_r(nullptr, ",", &save)) {
+                        if (rotate_endpoint_spec_cnt >= MAX_ROTATE_ENDPOINT_SPECS) {
+                            mylog(log_fatal, "too many rotate endpoint specs (max %d)\n",
+                                  MAX_ROTATE_ENDPOINT_SPECS);
+                            myexit(-1);
+                        }
+                        if (parse_listen_spec(item, rotate_endpoint_specs[rotate_endpoint_spec_cnt]) != 0)
+                            myexit(-1);
+                        rotate_endpoint_spec_cnt++;
+                    }
+                    if (rotate_endpoint_spec_cnt == 0) {
+                        mylog(log_fatal, "--rotate-endpoints requires at least one endpoint\n");
+                        myexit(-1);
+                    }
+                    mylog(log_info, "rotate_endpoint_specs=%d\n", rotate_endpoint_spec_cnt);
                 } else if (strcmp(long_options[option_index].name, "l2") == 0) {
                     no_l = 0;
                     if (listen_spec_cnt >= MAX_LISTEN_SPECS) {
@@ -1400,17 +1428,89 @@ int client_rotate_iptables_rule(int new_port) {
     }
     iptables_pattern = tmp_pattern;
 
+    // The rule table must follow the CURRENT remote's family — after a
+    // cross-family swap the startup-family command writes the rule into the
+    // wrong table (and the old rule was already deleted above).
+    string active_cmd;
+    if (wait_xtables_lock)
+        active_cmd = remote_addr.get_type() == AF_INET6 ? "ip6tables -w " : "iptables -w ";
+    else
+        active_cmd = remote_addr.get_type() == AF_INET6 ? "ip6tables " : "iptables ";
+
     string dummy = "";
     for (int i = 0; i <= iptables_rule_keeped; i++) {
         rule_keep[0][i] = dummy + iptables_pattern + " -j " + chain[0][i];
-        rule_keep_add[0][i] = iptables_command + "-I INPUT " + rule_keep[0][i];
-        rule_keep_del[0][i] = iptables_command + "-D INPUT " + rule_keep[0][i];
+        rule_keep_add[0][i] = active_cmd + "-I INPUT " + rule_keep[0][i];
+        rule_keep_del[0][i] = active_cmd + "-D INPUT " + rule_keep[0][i];
+        // the jump target chain must exist in THIS table too (it was created
+        // in the startup family's table) — create it idempotently
+        run_command(active_cmd + "-N " + chain[0][i], output, show_none);
+        run_command(active_cmd + "-F " + chain[0][i], output, show_none);
+        run_command(active_cmd + "-I " + chain[0][i] + " -j DROP", output, show_none);
         if (run_command(rule_keep_add[0][i], output, show_log) != 0) {
             mylog(log_warn, "rotate: failed to add iptables rule for new port %d\n", new_port);
             return -1;
         }
     }
     mylog(log_info, "rotate: iptables INPUT drop rule moved to sport %d\n", new_port);
+    return 0;
+}
+
+//————— standby (preconnect) INPUT-drop rule —————
+// The -a rule tracks the ACTIVE remote only; during a preconnect the standby
+// handshakes on an uncovered port and the kernel RSTs (faketcp) or ICMP-
+// rejects (udp) its packets from the server. Manage a second, independent
+// rule for the standby endpoint in the same chain; removed on swap or fail.
+static string standby_rule_add_str, standby_rule_del_str;
+
+static void client_iptables_cmd_for(int family, char *buf, int len) {
+    if (wait_xtables_lock)
+        snprintf(buf, len, "%s", family == AF_INET6 ? "ip6tables -w " : "iptables -w ");
+    else
+        snprintf(buf, len, "%s", family == AF_INET6 ? "ip6tables " : "iptables ");
+}
+
+int client_standby_rule_del();
+
+int client_standby_rule_add(const char *ip, int family, int port) {
+    if (!iptables_rule_added) return 0;  // -a not in use
+    char cmd[40];
+    client_iptables_cmd_for(family, cmd, sizeof(cmd));
+    char pattern[200];
+    pattern[0] = 0;
+    if (raw_mode == mode_faketcp) {
+        snprintf(pattern, sizeof(pattern), "-s %s -p tcp -m tcp --sport %d", ip, port);
+    } else if (raw_mode == mode_udp) {
+        snprintf(pattern, sizeof(pattern), "-s %s -p udp -m udp --sport %d", ip, port);
+    } else if (raw_mode == mode_icmp) {
+        if (family == AF_INET)
+            snprintf(pattern, sizeof(pattern), "-s %s -p icmp --icmp-type 0", ip);
+        else
+            snprintf(pattern, sizeof(pattern), "-s %s -p icmpv6 --icmpv6-type 129", ip);
+    } else {
+        return -1;
+    }
+    char *output;
+    client_standby_rule_del();  // drop any previous standby rule first
+    standby_rule_add_str = string(cmd) + "-I INPUT " + pattern + " -j " + chain[0][0];
+    standby_rule_del_str = string(cmd) + "-D INPUT " + pattern + " -j " + chain[0][0];
+    if (run_command(standby_rule_add_str, output, show_log) != 0) {
+        mylog(log_warn, "preconnect: failed to add standby drop rule for sport %d\n", port);
+        standby_rule_add_str.clear();
+        standby_rule_del_str.clear();
+        return -1;
+    }
+    mylog(log_info, "preconnect: standby drop rule added (src %s sport %d)\n", ip, port);
+    return 0;
+}
+
+int client_standby_rule_del() {
+    if (standby_rule_del_str.empty()) return 0;
+    char *output;
+    run_command(standby_rule_del_str, output, show_none);
+    run_command(standby_rule_del_str, output, show_none);  // twice, belt-and-braces
+    standby_rule_add_str.clear();
+    standby_rule_del_str.clear();
     return 0;
 }
 
@@ -1485,12 +1585,33 @@ void deferred_v6_cleanup() {
     v6_pending_del[0] = 0;
 }
 
-void client_discard_v6_preconnect(const my_ip_t &active_source) {
-    if (rotate_v6_prefix[0] == 0 || rotate_v6_dev[0] == 0 || raw_ip_version != AF_INET6)
+void client_discard_v6_preconnect(const my_ip_t &active_source, int active_family) {
+    if (rotate_v6_prefix[0] == 0 || rotate_v6_dev[0] == 0)
         return;
 
+    if (active_family != AF_INET6) {
+        if (v6_cur_addr[0] != 0) {
+            char cmd[200];
+            char *output;
+            snprintf(cmd, sizeof(cmd), "ip -6 addr del %s/128 dev %s", v6_cur_addr, rotate_v6_dev);
+            run_command(string(cmd), output, show_none);
+            mylog(log_info, "rotate-v6: discarded pending address %s dev %s\n",
+                  v6_cur_addr, rotate_v6_dev);
+        }
+        v6_cur_addr[0] = 0;
+        v6_pending_del[0] = 0;
+        return;
+    }
+
     char active_addr[100];
-    snprintf(active_addr, sizeof(active_addr), "%s", active_source.get_str2());
+    // Format with the caller's family, never the global raw_ip_version: that
+    // global tracks whichever family was last selected, and formatting the
+    // active v6 source as v4 here previously made the discard delete the
+    // ACTIVE flow's own /128 (self-inflicted return-path outage).
+    if (active_family == AF_INET6)
+        inet_ntop(AF_INET6, &active_source.v6, active_addr, sizeof(active_addr));
+    else
+        inet_ntop(AF_INET, &active_source.v4, active_addr, sizeof(active_addr));
     if (v6_cur_addr[0] != 0 && strcmp(v6_cur_addr, active_addr) != 0) {
         char cmd[200];
         char *output;
