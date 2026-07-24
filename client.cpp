@@ -87,7 +87,9 @@ static int pick_next_endpoint(address_t active, address_t &picked) {
     // check and the final pick — rolling twice could select the very endpoint
     // the exclusion just rejected (active's own IP+port), which then makes
     // the preconnect indistinguishable from the active flow at the demux.
-    int ports[MAX_LISTEN_SPECS];
+    // NB: sized by the endpoint pool cap, NOT MAX_LISTEN_SPECS — production
+    // pools run 30+ specs and a 4-entry array segfaults on the first roll.
+    int ports[MAX_ROTATE_ENDPOINT_SPECS];
     vector<int> preferred;
     vector<int> same_family;
     for (int i = 0; i < rotate_endpoint_spec_cnt; i++) {
