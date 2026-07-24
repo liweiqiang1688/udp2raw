@@ -1433,14 +1433,13 @@ int keep_iptables_rule()  // magic to work on a machine without grep/iptables --
 // port rotation. Without this the kernel would see packets from the new port
 // and RST the fake connection. Deletes the old jump(s), rebuilds the pattern
 // strings (so later keep/clear passes operate on the new port), re-adds.
+//
+// All table mutations run as ONE sh -c per keep-slot: the ev loop is
+// single-threaded, and the previous 6 fork+execs per rotation stalled packet
+// forwarding for ~100-300ms — audible as periodic hitches at high rotation
+// rates.
 int client_rotate_iptables_rule(int new_port) {
     if (!iptables_rule_added) return 0;  // -a not in use, nothing to swap
-
-    char *output;
-    for (int i = 0; i <= iptables_rule_keeped; i++) {
-        run_command(rule_keep_del[0][i], output, show_none);
-        run_command(rule_keep_del[0][i], output, show_none);  // twice, same as keep_iptables_rule
-    }
 
     char tmp_pattern[200];
     tmp_pattern[0] = 0;
@@ -1460,25 +1459,33 @@ int client_rotate_iptables_rule(int new_port) {
 
     // The rule table must follow the CURRENT remote's family — after a
     // cross-family swap the startup-family command writes the rule into the
-    // wrong table (and the old rule was already deleted above).
+    // wrong table.
     string active_cmd;
     if (wait_xtables_lock)
         active_cmd = remote_addr.get_type() == AF_INET6 ? "ip6tables -w " : "iptables -w ";
     else
         active_cmd = remote_addr.get_type() == AF_INET6 ? "ip6tables " : "iptables ";
 
+    char *output;
     string dummy = "";
     for (int i = 0; i <= iptables_rule_keeped; i++) {
+        // capture the OLD delete command (old pattern + old table) BEFORE
+        // rebuilding the bookkeeping for the new rule
+        string old_del = rule_keep_del[0][i];
+
         rule_keep[0][i] = dummy + iptables_pattern + " -j " + chain[0][i];
         rule_keep_add[0][i] = active_cmd + "-I INPUT " + rule_keep[0][i];
         rule_keep_del[0][i] = active_cmd + "-D INPUT " + rule_keep[0][i];
-        // the jump target chain must exist in THIS table too (it was created
-        // in the startup family's table) — create it idempotently
-        run_command(active_cmd + "-N " + chain[0][i], output, show_none);
-        run_command(active_cmd + "-F " + chain[0][i], output, show_none);
-        run_command(active_cmd + "-I " + chain[0][i] + " -j DROP", output, show_none);
-        if (run_command(rule_keep_add[0][i], output, show_log) != 0) {
-            mylog(log_warn, "rotate: failed to add iptables rule for new port %d\n", new_port);
+
+        // one fork: delete old jump twice (ignore errors, as keep_iptables_rule
+        // does), (re)create the chain in THIS table, add the new jump
+        string batch = old_del + " 2>/dev/null; " + old_del + " 2>/dev/null; "
+                     + active_cmd + "-N " + chain[0][i] + " 2>/dev/null; "
+                     + active_cmd + "-F " + chain[0][i] + "; "
+                     + active_cmd + "-I " + chain[0][i] + " -j DROP; "
+                     + rule_keep_add[0][i];
+        if (run_command(batch, output, show_log) != 0) {
+            mylog(log_warn, "rotate: failed to update iptables rule for new port %d\n", new_port);
             return -1;
         }
     }
