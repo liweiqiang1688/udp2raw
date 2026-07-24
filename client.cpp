@@ -846,6 +846,24 @@ static void swap_preconnect(conn_info_t &conn_info) {
     conn_info.last_hb_sent_time = 0;
     conn_info.last_oppsite_roller_time = conn_info.last_hb_recv_time;
 
+#ifdef UDP2RAW_LINUX
+    // Conv pre-sync: replay every active conv through the qualified standby so
+    // the server pre-creates the same ids on the new connection, and carry the
+    // table over into the promoted blob so the same ids keep being used.
+    // Without this, downlink streams only resume after each conv's first
+    // uplink packet registers server-side — an uplink+RTT gap that TCP's RTO
+    // backoff amplifies into seconds of stall on every rotation.
+    if (conn_info.blob && pre.conn.blob) {
+        select_client_family(pre.conn.raw_family);
+        char zero = 0;
+        for (auto &kv : conn_info.blob->conv_manager.c.conv_to_data)
+            send_data_safer(pre.conn, &zero, 1, kv.first);
+        for (auto &kv : conn_info.blob->conv_manager.c.conv_to_data)
+            pre.conn.blob->conv_manager.c.insert_conv(kv.first, kv.second);
+        select_client_family(conn_info.raw_family);
+    }
+#endif
+
     blob_t *old_blob = conn_info.blob;
     conn_info.blob = pre.conn.blob;
     pre.conn.blob = nullptr;
