@@ -196,6 +196,34 @@ struct drain_t {
     u64_t expire_time = 0;
 } drain;
 
+#ifdef UDP2RAW_LINUX
+// Recompute the receive BPF from the currently live flows. The filter must
+// cover the active flow's local port PLUS any standby/drain local port of the
+// same family: narrowing to just the active port while a standby is alive
+// silently blackholes the standby's heartbeat replies at the socket — the
+// standby then "expires" ~9s later and the next rotation finds no healthy
+// flow to swap onto (the 2026-07-25 standby-heartbeat-expiry bug).
+static void refresh_client_filter(conn_info_t &active_conn) {
+    if (disable_bpf_filter) return;
+    int lo = active_conn.raw_info.send_info.src_port;
+    int hi = lo;
+    if (pre.active && pre.conn.raw_family == active_conn.raw_family) {
+        int p = pre.conn.raw_info.send_info.src_port;
+        lo = std::min(lo, p);
+        hi = std::max(hi, p);
+    }
+    if (drain.active && drain.conn.raw_family == active_conn.raw_family) {
+        int p = drain.conn.raw_info.send_info.src_port;
+        lo = std::min(lo, p);
+        hi = std::max(hi, p);
+    }
+    if (lo == hi)
+        init_filter(lo);
+    else
+        attach_range_filter(raw_recv_fd, active_conn.raw_family, lo, hi);
+}
+#endif
+
 static void fail_preconnect(conn_info_t &active_conn, const char *reason) {
     mylog(log_warn, "%s; keeping active flow\n", reason);
     int failed_family = pre.conn.raw_family;
@@ -314,7 +342,8 @@ int client_on_timer(conn_info_t &conn_info)  // for client. called when a timer 
     packet_info_t &recv_info = conn_info.raw_info.recv_info;
 
     // Expire the postconnect drain window: the old flow is torn down and the
-    // BPF narrows back to just the new port.
+    // BPF is recomputed from whatever flows remain (a standby may be live —
+    // narrowing to just the active port here used to starve its heartbeats).
     if (drain.active && get_current_time() > drain.expire_time) {
         mylog(log_info, "postconnect drain expired — old flow torn down\n");
         drain.active = 0;
@@ -322,8 +351,7 @@ int client_on_timer(conn_info_t &conn_info)  // for client. called when a timer 
         drain.conn.blob = nullptr;
         drain.conn.re_init();
 #ifdef UDP2RAW_LINUX
-        if (!disable_bpf_filter)
-            init_filter(conn_info.raw_info.send_info.src_port);
+        refresh_client_filter(conn_info);
 #endif
     }
 
@@ -931,17 +959,9 @@ static void swap_preconnect(conn_info_t &conn_info) {
 #ifdef UDP2RAW_LINUX
     if (conn_info.raw_family == AF_INET6)
         deferred_v6_cleanup();  // old source address is no longer needed
-    if (!disable_bpf_filter) {
-        if (drain.active && drain.conn.raw_family == conn_info.raw_family) {
-            // same-family drain: keep BOTH ports in the filter until the
-            // drain window expires (expiry narrows it back to the new port)
-            int lo = std::min(drain.conn.raw_info.send_info.src_port, conn_info.raw_info.send_info.src_port);
-            int hi = std::max(drain.conn.raw_info.send_info.src_port, conn_info.raw_info.send_info.src_port);
-            attach_range_filter(raw_recv_fd, conn_info.raw_family, lo, hi);
-        } else {
-            init_filter(conn_info.raw_info.send_info.src_port);
-        }
-    }
+    // pre was just consumed (pre.active == 0); keep the drain port covered
+    // until its window expires (recomputed from live flows).
+    refresh_client_filter(conn_info);
     client_rotate_iptables_rule(new_port);
 #endif
     mylog(log_info, "preconnect swap: active raw flow is now %s:%d\n",
