@@ -1529,6 +1529,14 @@ int client_standby_rule_add(const char *ip, int family, int port) {
     }
     char *output;
     client_standby_rule_del();  // drop any previous standby rule first
+    // Self-heal: the target chain can be missing (a cleanup sweep removes
+    // udp2rawDwrW chains on every go.sh restart; a second sweep landing after
+    // this process recreated its chain would make the rule add below fail
+    // with "No chain/target/match by that name" — seen 32x on the home server,
+    // 2026-07-26). Recreate it idempotently: -N succeeds only when missing.
+    if (run_command(string(cmd) + "-N " + chain[0][0], output, show_none) == 0) {
+        run_command(string(cmd) + "-I " + chain[0][0] + " -j DROP", output, show_none);
+    }
     standby_rule_add_str = string(cmd) + "-I INPUT " + pattern + " -j " + chain[0][0];
     standby_rule_del_str = string(cmd) + "-D INPUT " + pattern + " -j " + chain[0][0];
     if (run_command(standby_rule_add_str, output, show_log) != 0) {
